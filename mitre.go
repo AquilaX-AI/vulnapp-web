@@ -51,6 +51,18 @@ var (
 	cmdInjectPattern = regexp.MustCompile(`(?i)(;\s*(sleep|cat|ls|whoami|id)\b|\|\|?\s*\w|&&\s*\w|\$\()`)
 	sstiPattern      = regexp.MustCompile(`\{\{.*\}\}`)
 	scannerUAPattern = regexp.MustCompile(`(?i)(sqlmap|nikto|nmap|nessus|acunetix|nuclei|gobuster|dirbuster|wpscan|masscan|zgrab|burp|zap)`)
+
+	// Mass-exploitation CVE payloads. Our stack can't actually be
+	// vulnerable to any of these (no Java, no Bash CGI, no XML parser
+	// exposed) - internet-wide scanners (both researchers' and
+	// criminals') blast them at literally everything regardless, so
+	// catching the attempt is valuable signal independent of whether it
+	// could ever have worked here.
+	log4shellPattern    = regexp.MustCompile(`(?i)\$\{jndi:`)
+	spring4shellPattern = regexp.MustCompile(`(?i)class\.module\.classLoader|getClass\(\)\.forName`)
+	shellshockPattern   = regexp.MustCompile(`\(\)\s*\{\s*:;\s*;?\s*\}`)
+	xxePattern          = regexp.MustCompile(`(?i)<!ENTITY|<!DOCTYPE[^>]*SYSTEM`)
+	nosqliPattern       = regexp.MustCompile(`(?i)\$(ne|gt|lt|where|regex)\b`)
 )
 
 // mitreRules is ordered most-specific/highest-signal first, since
@@ -67,6 +79,21 @@ var mitreRules = []mitreRule{
 		}
 		return strings.HasPrefix(r.URL.Path, "/uploads/") &&
 			(strings.Contains(r.URL.Path, "backup.sql") || strings.Contains(r.URL.Path, "config.old"))
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Log4Shell (CVE-2021-44228) Exploitation Attempt", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, log4shellPattern)
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Spring4Shell (CVE-2022-22965) Exploitation Attempt", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, spring4shellPattern)
+	}},
+	{"T1059", "Command and Scripting Interpreter", "Shellshock (CVE-2014-6271) Exploitation Attempt", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, shellshockPattern)
+	}},
+	{"T1190", "Exploit Public-Facing Application", "XXE Injection Attempt", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, xxePattern)
+	}},
+	{"T1190", "Exploit Public-Facing Application", "NoSQL Injection Attempt", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, nosqliPattern)
 	}},
 	{"T1098", "Account Manipulation", "Privilege Escalation Attempt", func(r *http.Request, _ []string) bool {
 		return r.URL.Path == "/api/profile" && (r.Method == http.MethodPut || r.Method == http.MethodPatch)
@@ -119,6 +146,12 @@ func anyMatch(values []string, re *regexp.Regexp) bool {
 	return false
 }
 
+// injectionHeaders are commonly used as injection vectors specifically
+// to dodge WAFs/scanners that only inspect the query string and body -
+// Log4Shell in the wild was famously delivered via User-Agent and
+// X-Forwarded-For as often as any request parameter.
+var injectionHeaders = []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Referer", "User-Agent", "Cookie"}
+
 func allValues(r *http.Request, bodyValues url.Values) []string {
 	var out []string
 	for _, v := range r.URL.Query() {
@@ -126,6 +159,11 @@ func allValues(r *http.Request, bodyValues url.Values) []string {
 	}
 	for _, v := range bodyValues {
 		out = append(out, v...)
+	}
+	for _, h := range injectionHeaders {
+		if v := r.Header.Get(h); v != "" {
+			out = append(out, v)
+		}
 	}
 	return out
 }

@@ -270,6 +270,70 @@ set: it has no equivalent for the race conditions or the ReDoS in
 [`pentest.go`](pentest.go), since spotting those needs request *timing/
 sequencing*, not a pattern in a single request's content.
 
+### Beyond pattern matching
+
+A few detection mechanisms that don't fit the "does this one request
+contain a known bad string" model above:
+
+- **Known mass-exploitation CVE payloads.** Log4Shell (`${jndi:...}`),
+  Spring4Shell (`class.module.classLoader...`), and Shellshock
+  (`() { :; };`) all get tagged in `mitre.go` even though nothing here
+  could actually be vulnerable to any of them (no Java, no Bash CGI) -
+  internet-wide scanners blast these at literally everything regardless,
+  so catching the attempt is valuable signal on its own.
+- **Header-based injection.** The classifier doesn't just check the
+  query string and body - it also scans `X-Forwarded-For`,
+  `X-Forwarded-Host`, `X-Real-IP`, `Referer`, `User-Agent`, and `Cookie`
+  for the same injection patterns, since a lot of real attacks
+  (Log4Shell especially) ride in headers specifically to dodge
+  body-only WAFs.
+- **TLS JA3 fingerprinting** ([`ja3.go`](ja3.go)). Every HTTPS connection
+  has its raw ClientHello sniffed before the TLS layer consumes it, and
+  reduced to a JA3 hash - a fingerprint of how the client's TLS library
+  actually negotiates (cipher suite list, extension order, elliptic
+  curves), not anything the request claims to be. It survives
+  User-Agent spoofing: a tool that rotates its UA per request but reuses
+  the same underlying HTTP client library still produces the same JA3
+  hash every time, which is what lets you correlate requests back to
+  one actor regardless of what they call themselves. Verified against
+  real clients: three `curl` requests produced an identical hash,
+  Python's `ssl` module produced a different one.
+- **Rate-based scanning detection** ([`ratedetect.go`](ratedetect.go)).
+  Tracks request timestamps per IP in memory; more than 20 requests from
+  the same IP within 5 seconds gets tagged as `T1595.002 Active
+  Scanning` even if no single request matched any payload signature -
+  catching careful scanners that avoid obvious strings but still crawl
+  far faster than any human.
+- **A hidden honeytoken link.** Every page footer includes an
+  `aria-hidden`, off-screen-positioned link to `/__trap/audit-export`
+  (also listed in `robots.txt`'s `Disallow`, since some aggressive
+  scanners specifically check disallowed paths). No real visitor can
+  click it. Reaching it at all is about as close to proof of automation
+  as a single request gets.
+- **UDP amplification-vector probes** ([`udpservices.go`](udpservices.go)).
+  SNMP (161), NTP (123), memcached (11211/UDP), SSDP (1900), and chargen
+  (19) all get a listener purely to detect and log probe/abuse attempts.
+  These intentionally behave differently from every TCP fake service in
+  this repo: UDP has no handshake, so the source address on any packet
+  could be spoofed, and a real amplifying reply would make this host a
+  usable DDoS reflector against whoever that spoofed address actually
+  belongs to - a real third party, not just this test box. So NTP,
+  memcached, SSDP, and chargen get logged and **never answered**, and
+  SNMP's reply (the actual recon signal - confirming the `public`
+  community string works) is kept deliberately small, with no
+  exploitable amplification factor. Verified against real tooling: a
+  genuine `snmpget` correctly read back the fake `sysDescr` value.
+- **Canary-token hook.** `/internal/metadata`'s AWS-style access key
+  pair can be swapped for a real one via `CANARY_AWS_ACCESS_KEY_ID` /
+  `CANARY_AWS_SECRET_ACCESS_KEY`. A free canary token (e.g. from
+  [canarytokens.org](https://canarytokens.org)) looks like a working AWS
+  key and does nothing on its own, but alerts you - by email/webhook,
+  completely outside this app - the moment someone actually tries to use
+  it against the real AWS API. That turns "someone extracted this fake
+  secret" from a log line here into external, out-of-band proof it
+  happened and got used. Nothing is provisioned by default; without the
+  env vars set, the static fake key is used exactly as before.
+
 ## What different kinds of scanners will find
 
 The table above is mostly DAST bait - a live crawl/active-scan finds it.
@@ -323,7 +387,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **80 findings across 18 rule IDs**, including:
+reports **84 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|

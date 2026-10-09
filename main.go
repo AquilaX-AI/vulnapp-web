@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -65,6 +66,7 @@ func main() {
 	// robots.txt that points a crawler straight at the "sensitive" areas -
 	// a very common real-world recon source.
 	mux.HandleFunc("/robots.txt", handleRobotsTxt)
+	mux.HandleFunc("/__trap/", handleHoneytokenTrap)
 
 	// A fake OpenAPI spec is an even better recon source than robots.txt:
 	// it names every endpoint, including the ones nothing on the site
@@ -130,6 +132,8 @@ func main() {
 	// internet-facing (databases, caches, remote admin, container APIs,
 	// ...) - the same idea as the web app, one layer down the stack.
 	startFakeServices()
+	startUDPServices()
+	startRateDetectCleanup()
 
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")
 	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")
@@ -160,7 +164,18 @@ func main() {
 			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 		}
 		fmt.Printf("vulnapp-web listening on https://%s (self-signed certificate, minted per-hostname on connect, intentionally vulnerable - do not expose publicly)\n", httpsAddr)
-		errCh <- srv.ListenAndServeTLS("", "")
+
+		// A plain net.Listen + manual wrapping, rather than
+		// ListenAndServeTLS, so the JA3 sniffer (ja3.go) gets to see each
+		// connection's raw ClientHello bytes before the TLS layer
+		// consumes them.
+		rawLn, err := net.Listen("tcp", httpsAddr)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		tlsLn := tls.NewListener(newJA3Listener(rawLn), srv.TLSConfig)
+		errCh <- srv.Serve(tlsLn)
 	}()
 
 	log.Fatal(<-errCh)
@@ -181,7 +196,17 @@ func getenvDefault(key, fallback string) string {
 // "missing entirely".
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if tag := classifyRequest(r); tag != "" {
+		tag := classifyRequest(r)
+		if tag == "" {
+			ip := r.RemoteAddr
+			if host, _, err := net.SplitHostPort(ip); err == nil {
+				ip = host
+			}
+			if detectHighFrequencyScanning(ip) {
+				tag = "T1595.002 Active Scanning: Vulnerability Scanning | High-Frequency Automated Scanning Detected"
+			}
+		}
+		if tag != "" {
 			log.Printf("%s %s %s [%s]", r.RemoteAddr, r.Method, r.URL.String(), tag)
 		} else {
 			log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.String())

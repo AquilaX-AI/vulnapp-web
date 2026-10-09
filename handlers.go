@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -78,6 +80,9 @@ const pageFooter = `
     <a href="/admin">Staff portal</a>
     <p>&copy; 2026 Acme Supplies Co.</p>
   </div>
+  <!-- honeytoken: hidden from any real visitor, exists only so an
+       automated crawler following every href finds it -->
+  <a href="/__trap/audit-export" style="position:absolute;left:-9999px" aria-hidden="true" tabindex="-1">internal audit export</a>
 </footer>
 <script src="/static/app.js"></script>
 </body>
@@ -780,9 +785,24 @@ func handleInternalMetadata(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"instance_id":       "i-0fakeinstance00",
 		"iam_role":          "vulnapp-fake-role",
-		"access_key_id":     "AKIAFAKEFAKEFAKEFAKE",
-		"secret_access_key": "FakeSecretAccessKeyDoNotUseThisIsADemoValue",
+		"access_key_id":     canaryOr("CANARY_AWS_ACCESS_KEY_ID", "AKIAFAKEFAKEFAKEFAKE"),
+		"secret_access_key": canaryOr("CANARY_AWS_SECRET_ACCESS_KEY", "FakeSecretAccessKeyDoNotUseThisIsADemoValue"),
 	})
+}
+
+// canaryOr returns a real canary-token credential if one's configured
+// via the given env var, falling back to the static fake value
+// otherwise. A canary token (e.g. a free one from canarytokens.org) is a
+// real, working-looking AWS key that does nothing on its own but alerts
+// you - by email/webhook, completely outside this app - the moment
+// someone actually tries to use it against the real AWS API. That turns
+// "someone extracted this fake secret" from a log line here into
+// external, out-of-band proof that it happened and got used.
+func canaryOr(envVar, fallback string) string {
+	if v := os.Getenv(envVar); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // ---------------------------------------------------------------------
@@ -815,7 +835,20 @@ Disallow: /crash
 Disallow: /.git/
 Disallow: /config.php.bak
 Disallow: /phpinfo.php
+Disallow: /__trap/
 `)
+}
+
+// handleHoneytokenTrap backs the hidden, off-screen link in pageFooter
+// (and the robots.txt Disallow above - some aggressive scanners
+// specifically check Disallow'd paths). No real visitor can click a
+// link positioned off-screen with aria-hidden set, so reaching this
+// path at all is a near-certain sign of an automated crawler/scanner,
+// independent of anything about the request's content.
+func handleHoneytokenTrap(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s followed hidden honeytoken link %s [T1595.002 Active Scanning: Vulnerability Scanning | Automated Crawler/Scanner Confirmed (no human would click a hidden link)]", r.RemoteAddr, r.URL.Path)
+	w.WriteHeader(http.StatusNotFound)
+	fmt.Fprint(w, "404 page not found")
 }
 
 // ---------------------------------------------------------------------
