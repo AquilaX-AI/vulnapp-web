@@ -133,6 +133,7 @@ func main() {
 	// ...) - the same idea as the web app, one layer down the stack.
 	startFakeServices()
 	startUDPServices()
+	startAIServices()
 	startRateDetectCleanup()
 
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")

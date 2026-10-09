@@ -175,7 +175,10 @@ box/VM management and this app should never contend with it for the port.
 | 2375 | Docker Engine API (no TLS) | Full fake HTTP `/version` response |
 | 5984 | CouchDB 1.6.1 | Full fake HTTP root response |
 | 8500 | Consul 0.7.0 | Full fake HTTP agent-self response |
-| 5432, 1433, 3389, 5900, 27017 | PostgreSQL, MSSQL, RDP, VNC, MongoDB | Port accepts the connection and stays silent - protocol-accurate, since real clients speak first on all five |
+| 5900 | VNC | **Stateful**: real RFB handshake offering security-type `None` - verified with a real `nmap --script vnc-info`, which reports "Server does not require authentication" |
+| 30000 | Kubernetes Dashboard | Landing page + a "Skip" link to a fake cluster overview - the exact misconfiguration behind the 2018 Tesla cryptomining breach (NodePort reachable, no RBAC) |
+| 3001 | Open WebUI | Fake `/api/config` + signup page with no auth - the self-hosted-LLM-era version of the same "forgot to lock it down" mistake |
+| 5432, 1433, 3389, 27017 | PostgreSQL, MSSQL, RDP, MongoDB | Port accepts the connection and stays silent - protocol-accurate, since real clients speak first on all four |
 
 The mail stack an MX record would actually point at ([`mailservices.go`](mailservices.go)), plus a DNS nameserver that allows zone transfers ([`dns.go`](dns.go)) - these are **stateful, multi-step protocol simulations**, not single banners, modeling the specific real misconfiguration behind each one:
 
@@ -222,6 +225,27 @@ binary-protocol databases/brokers:
 | 10250 | kubelet API | Fake `/pods` PodList - the real historical no-authn/authz misconfiguration |
 | 5985 | WinRM | Real 401 + `Negotiate` challenge - still fingerprints a reachable remote-management endpoint |
 | 1521, 9042, 9092, 5672, 61616, 445 | Oracle, Cassandra, Kafka, RabbitMQ (AMQP), ActiveMQ (OpenWire), SMB | Port accepts the connection and stays silent - protocol-accurate, clients speak first on all six |
+
+The newest category - AI/LLM infrastructure ([`aiservices.go`](aiservices.go)) - researched against what's actually being found and exploited right now rather than guessed at: SentinelLABS/Censys counted ~175,000 exposed Ollama instances in early 2026, and the "Operation Bizarre Bazaar" campaign (Sysdig/Pillar Security, Feb 2026) scanned for Ollama and unauthenticated MCP servers side by side.
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 11434 | Ollama | Real root response (`Ollama is running`), `/api/tags` model inventory, `/api/pull` (models the model-theft vector behind the real exposure reports), `/api/generate` (models LLMjacking - free inference on someone else's GPU) |
+| 6277 | An MCP server | JSON-RPC `tools/list` reveals a capability manifest (filesystem/shell/database/cloud access) - the exact thing real scanning campaigns check for |
+| 8000 | ChromaDB | Fake `/api/v1/collections` - names CVE-2026-45829 ("ChromaToast"), a CVSS 10.0 pre-auth RCE reportedly affecting most exposed instances |
+| 9091 | Milvus | Fake unauthenticated management API on the metrics port - names CVE-2026-26190 |
+
+And edge devices - VPN/firewall/remote-access appliances - which GreyNoise's 2026 State of the Edge report found absorb more sustained, systematic internet-wide exploitation than any other category (Palo Alto GlobalProtect alone drew 3.5x the combined traffic Cisco and Fortinet saw), matching Mandiant M-Trends 2025's top four most-exploited CVE families (PAN-OS, Ivanti Connect Secure, Ivanti Policy Secure, FortiClient EMS):
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 4433 | Palo Alto GlobalProtect Portal | Login page naming a PAN-OS version |
+| 4434 | Fortinet FortiGate | Login page naming a FortiOS version |
+| 4435 | Ivanti Connect Secure | Login page naming a version |
+| 4436 | SonicWall | Login page naming a SonicOS version |
+| 8291, 8728 | MikroTik RouterOS (WinBox, RouterOS API) | Port accepts the connection and stays silent - both are binary protocols I didn't have a trusted client to verify a fuller fake against |
+
+(Real deployments put edge-device portals on :443 of their own dedicated appliance IP; faked here on distinct ports purely to avoid colliding with this app's own HTTPS listener.)
 
 ## MITRE ATT&CK tagging in the logs
 
@@ -387,7 +411,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **84 findings across 18 rule IDs**, including:
+reports **98 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|

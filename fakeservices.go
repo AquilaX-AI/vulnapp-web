@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -42,13 +43,17 @@ func startFakeServices() {
 	// DNS zone transfer (AXFR) - see dns.go.
 	startDNSAXFRService(":53")
 
+	// VNC is actually server-speaks-first (the RFB handshake), unlike
+	// the rest of this group - see startVNCService below.
+	startVNCService(":5900")
+
 	// Protocols where the client speaks first (PostgreSQL, MSSQL, RDP,
-	// VNC, MongoDB, Oracle, Cassandra, Kafka, RabbitMQ/AMQP, ActiveMQ,
-	// SMB): accepting the connection and staying silent is actually
+	// MongoDB, Oracle, Cassandra, Kafka, RabbitMQ/AMQP, ActiveMQ, SMB):
+	// accepting the connection and staying silent is actually
 	// protocol-accurate, and still enough for a port scanner to mark the
 	// port "open".
 	for _, addr := range []string{
-		":5432", ":1433", ":3389", ":5900", ":27017",
+		":5432", ":1433", ":3389", ":27017",
 		":1521", ":9042", ":9092", ":5672", ":61616", ":445",
 	} {
 		startSilentService(addr)
@@ -91,6 +96,34 @@ func startFakeServices() {
 	startFakeHTTPService(":6443", handleFakeKubernetesAPI)
 	startFakeHTTPService(":10250", handleFakeKubelet)
 	startFakeHTTPService(":5985", handleFakeWinRM)
+
+	// A dashboard left reachable on its NodePort without RBAC is the
+	// exact root cause behind the 2018 Tesla cryptomining breach - and
+	// a self-hosted LLM chat UI left open is the newer version of the
+	// same "spun it up, forgot to put auth in front of it" mistake.
+	startFakeHTTPService(":30000", handleFakeKubernetesDashboard)
+	startFakeHTTPService(":3001", handleFakeOpenWebUI)
+
+	// Edge devices - VPN/firewall/remote-access appliances - are, per
+	// GreyNoise's 2026 State of the Edge report, the single most
+	// heavily and systematically exploited category on the internet
+	// right now (Palo Alto GlobalProtect alone drew 3.5x the combined
+	// traffic Cisco and Fortinet saw), and Mandiant's M-Trends 2025
+	// lists PAN-OS, Ivanti Connect Secure, Ivanti Policy Secure, and
+	// FortiClient EMS as the four most frequently exploited CVE
+	// families overall. Real deployments put these on :443 of their
+	// own dedicated appliance IP; faked here on distinct ports purely
+	// to avoid colliding with this app's own HTTPS listener.
+	startFakeHTTPService(":4433", handleFakeGlobalProtect)
+	startFakeHTTPService(":4434", handleFakeFortiGate)
+	startFakeHTTPService(":4435", handleFakeIvantiConnectSecure)
+	startFakeHTTPService(":4436", handleFakeSonicWall)
+
+	// MikroTik RouterOS: WinBox and the RouterOS API are both binary
+	// protocols; rather than guess at byte-level details I can't verify
+	// against a real client here, these stay simple open-port signals.
+	startSilentService(":8291") // WinBox
+	startSilentService(":8728") // RouterOS API
 }
 
 func startBannerService(addr, banner string, reply func(string) string) {
@@ -196,6 +229,18 @@ var portAttackCategory = map[string]string{
 	":6443":  "Kubernetes API Exploitation Attempt",
 	":10250": "Kubernetes Node Exploitation Attempt",
 	":5985":  "Remote Management / Lateral Movement Attempt",
+	":30000": "Kubernetes Cluster Takeover Attempt",
+	":3001":  "AI Chat Service / API Key Disclosure Attempt",
+	":11434": "AI Model Serving Exploitation Attempt",
+	":6277":  "Unauthenticated MCP Server Exploitation Attempt",
+	":8000":  "Unauthenticated Vector Database Access Attempt",
+	":9091":  "Unauthenticated Vector Database Management API Access Attempt",
+	":4433":  "Edge VPN Appliance Exploitation Attempt",
+	":4434":  "Edge Firewall Appliance Exploitation Attempt",
+	":4435":  "Edge VPN Appliance Exploitation Attempt",
+	":4436":  "Edge VPN Appliance Exploitation Attempt",
+	":8291":  "Network Device Management Access Attempt",
+	":8728":  "Network Device Management Access Attempt",
 }
 
 func attackCategoryForAddr(addr string) string {
@@ -205,6 +250,80 @@ func attackCategoryForAddr(addr string) string {
 		}
 	}
 	return "Exposed Service Access Attempt"
+}
+
+// startVNCService implements enough of the real RFB handshake to model
+// the actual vulnerability behind an exposed VNC server: no password at
+// all. The server genuinely does speak first in RFB (a version string,
+// immediately on connect), so this is real protocol behavior, not a
+// simplification - offering security-type 1 ("None") is the specific
+// misconfiguration a tool like `nmap --script vnc-info` reports as
+// "VNC Authentication: disabled".
+func startVNCService(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	go acceptLoop(ln, handleVNCConn)
+}
+
+func handleVNCConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// ProtocolVersion message - server speaks first.
+	if _, err := conn.Write([]byte("RFB 003.008\n")); err != nil {
+		return
+	}
+	clientVersion := make([]byte, 12)
+	if _, err := io.ReadFull(conn, clientVersion); err != nil {
+		return
+	}
+
+	// Security handshake (RFB 3.7+ shape): one security type offered,
+	// None (1) - the actual finding, logged as soon as it's offered
+	// rather than waiting on the client to pick one, since a recon-only
+	// probe (nmap's vnc-info, for instance) already has everything it
+	// needs at this point and may not continue the handshake further. A
+	// real, password-protected server would offer type 2 (VNC
+	// Authentication) instead/as well.
+	log.Printf("%s VNC security handshake: offered None (no password required) [T1133 External Remote Services | Unauthenticated Remote Desktop Access Attempt]", conn.RemoteAddr())
+	if _, err := conn.Write([]byte{0x01, 0x01}); err != nil { // count=1, types=[None]
+		return
+	}
+	chosen := make([]byte, 1)
+	if _, err := io.ReadFull(conn, chosen); err != nil {
+		return
+	}
+
+	// SecurityResult: OK. No challenge needed for security-type None.
+	if _, err := conn.Write([]byte{0x00, 0x00, 0x00, 0x00}); err != nil {
+		return
+	}
+
+	// ClientInit (1 byte, shared-flag) - read and discard.
+	clientInit := make([]byte, 1)
+	if _, err := io.ReadFull(conn, clientInit); err != nil {
+		return
+	}
+
+	// ServerInit: framebuffer size, pixel format, and a name string -
+	// enough for a real client/scanner to confirm a working session.
+	serverInit := []byte{
+		0x04, 0x00, // width = 1024
+		0x03, 0x00, // height = 768
+		32, 24, 0, 1, // bits-per-pixel, depth, big-endian-flag, true-colour-flag
+		0x00, 0xff, 0x00, 0xff, 0x00, 0xff, // red/green/blue-max (255 each)
+		16, 8, 0, // red/green/blue-shift
+		0, 0, 0, // padding
+	}
+	name := []byte("acme-web01-console")
+	nameLen := make([]byte, 4)
+	nameLen[3] = byte(len(name))
+	conn.Write(serverInit)
+	conn.Write(nameLen)
+	conn.Write(name)
 }
 
 // startFTPService models the actual vulnerability behind an exposed
@@ -733,4 +852,87 @@ func handleFakeWinRM(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Negotiate")
 	w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+// handleFakeKubernetesDashboard models the exact misconfiguration behind
+// the 2018 Tesla cryptomining breach: a Kubernetes Dashboard reachable
+// on its NodePort with no RBAC in front of it, where clicking "Skip"
+// instead of providing a token logs you in with whatever privileges the
+// dashboard's own service account has - often cluster-admin. The fake
+// overview reuses the same pod/namespace data as the kubelet fake for a
+// consistent story across both.
+func handleFakeKubernetesDashboard(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+  "namespaces": ["default", "kube-system", "acme-prod"],
+  "pods": [
+    {"name": "orders-api-6f9d8", "namespace": "acme-prod", "status": "Running"},
+    {"name": "auth-svc-7c2b1", "namespace": "acme-prod", "status": "Running"}
+  ],
+  "serviceAccountToken": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZha2Uta2V5LWlkIn0.FAKE.DO-NOT-USE"
+}`)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Kubernetes Dashboard</title></head>
+<body><h1>Kubernetes Dashboard</h1>
+<p>Please provide a token, or <a href="/api/v1/overview">skip</a> to continue with the dashboard's own service account.</p>
+</body></html>`)
+}
+
+// handleFakeOpenWebUI models an Open WebUI (self-hosted LLM chat
+// frontend) instance left reachable with signups enabled and no auth in
+// front of it - the newer version of the same "spun it up, forgot to
+// lock it down" mistake, except what leaks here is chat history and
+// whatever API keys were configured for the backing model provider.
+func handleFakeOpenWebUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/config" {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":true,"name":"Open WebUI","version":"0.1.125","default_locale":"en","features":{"enable_signup":true,"enable_api_key":true}}`)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Open WebUI</title></head>
+<body><h1>Open WebUI</h1><p>Sign up to get started - the first account created becomes the admin.</p></body></html>`)
+}
+
+// --- Edge device (VPN/firewall) portal fakes ---
+//
+// Per GreyNoise's 2026 State of the Edge report, these are the single
+// most heavily and systematically targeted category of internet-facing
+// service there is right now - these fakes exist to give that category
+// at least minimal representation, not because any one vendor is
+// uniquely interesting.
+
+func handleFakeGlobalProtect(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>GlobalProtect Portal</title></head>
+<body><h1>GlobalProtect Portal</h1><form method="post" action="/global-protect/login.esp">
+<input name="user" placeholder="Username"><input name="passwd" type="password" placeholder="Password"><button>Log In</button>
+</form><p><small>PAN-OS 10.2.1</small></p></body></html>`)
+}
+
+func handleFakeFortiGate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>FortiGate</title></head>
+<body><h1>FortiGate</h1><form method="post" action="/remote/login">
+<input name="username" placeholder="Username"><input name="credential" type="password" placeholder="Password"><button>Login</button>
+</form><p><small>FortiOS v7.0.6</small></p></body></html>`)
+}
+
+func handleFakeIvantiConnectSecure(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Ivanti Connect Secure</title></head>
+<body><h1>Ivanti Connect Secure</h1><form method="post" action="/dana-na/auth/url_default/welcome.cgi">
+<input name="username" placeholder="Username"><input name="password" type="password" placeholder="Password"><button>Sign In</button>
+</form><p><small>9.1R18</small></p></body></html>`)
+}
+
+func handleFakeSonicWall(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>SonicWall Network Security</title></head>
+<body><h1>SonicWall Network Security Appliance</h1><form method="post">
+<input name="username" placeholder="Username"><input name="password" type="password" placeholder="Password"><button>Login</button>
+</form><p><small>SonicOS 7.0.1</small></p></body></html>`)
 }
