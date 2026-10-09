@@ -19,7 +19,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io/fs"
 	"log"
@@ -83,7 +82,7 @@ func main() {
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")
 	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")
 
-	cert, err := loadOrGenerateCert()
+	tlsConfig, err := certSource()
 	if err != nil {
 		log.Fatalf("failed to prepare TLS certificate: %v", err)
 	}
@@ -99,9 +98,9 @@ func main() {
 		srv := &http.Server{
 			Addr:      httpsAddr,
 			Handler:   handler,
-			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+			TLSConfig: tlsConfig,
 		}
-		fmt.Printf("vulnapp-web listening on https://%s (self-signed certificate, intentionally vulnerable - do not expose publicly)\n", httpsAddr)
+		fmt.Printf("vulnapp-web listening on https://%s (self-signed certificate, minted per-hostname on connect, intentionally vulnerable - do not expose publicly)\n", httpsAddr)
 		errCh <- srv.ListenAndServeTLS("", "")
 	}()
 
