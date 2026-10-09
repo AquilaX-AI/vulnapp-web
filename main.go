@@ -113,6 +113,11 @@ func main() {
 
 	fmt.Printf("vulnapp-web %s\n", version)
 
+	// Fake TCP/HTTP services on a batch of ports that should never be
+	// internet-facing (databases, caches, remote admin, container APIs,
+	// ...) - the same idea as the web app, one layer down the stack.
+	startFakeServices()
+
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")
 	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")
 

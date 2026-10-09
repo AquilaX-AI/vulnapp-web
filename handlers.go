@@ -212,9 +212,9 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 
 func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, pageHeader("Sign in"))
 
 	if r.Method != http.MethodPost {
+		fmt.Fprint(w, pageHeader("Sign in"))
 		fmt.Fprint(w, `<h1>Sign in</h1>
 <form action="/login" method="post">
   <input name="username" placeholder="Username">
@@ -239,6 +239,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(query)
 	if err != nil {
 		// Error-based SQLi: the raw database error is reflected back.
+		fmt.Fprint(w, pageHeader("Sign in"))
 		fmt.Fprint(w, sqlErrorBanner("/var/www/html/login.php", err))
 		fmt.Fprint(w, pageFooter)
 		return
@@ -251,7 +252,10 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&id, &uname, &role)
 
 		// Insecure cookie: no Secure, HttpOnly, or SameSite attributes,
-		// and the value is client-trusted on every later request.
+		// and the value is client-trusted on every later request. These
+		// MUST be set before any body bytes are written (below), or
+		// Go's http package flushes a 200 with no Set-Cookie headers
+		// and they're silently dropped.
 		http.SetCookie(w, &http.Cookie{Name: "role", Value: role})
 		http.SetCookie(w, &http.Cookie{Name: "username", Value: uname})
 
@@ -273,6 +277,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		fmt.Fprint(w, pageHeader("Sign in"))
 		fmt.Fprintf(w, `<h1>Welcome back, %s</h1><p><a href="/account?id=%d">Go to my account</a></p>`, uname, id)
 		fmt.Fprint(w, pageFooter)
 		return
@@ -283,12 +288,14 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	existsQuery := fmt.Sprintf("SELECT 1 FROM users WHERE username='%s'", username)
 	existsRows, err := db.Query(existsQuery)
 	if err != nil {
+		fmt.Fprint(w, pageHeader("Sign in"))
 		fmt.Fprint(w, sqlErrorBanner("/var/www/html/login.php", err))
 		fmt.Fprint(w, pageFooter)
 		return
 	}
 	defer existsRows.Close()
 
+	fmt.Fprint(w, pageHeader("Sign in"))
 	if existsRows.Next() {
 		fmt.Fprint(w, "<p>That password doesn't look right. Please try again.</p>")
 	} else {

@@ -38,8 +38,13 @@ go run .
 
 By default the app listens on **:80** for plain HTTP and **:443** for
 HTTPS, using a self-signed certificate generated fresh at every startup
-(see below) - no reverse proxy needed. Binding those ports on Linux
-requires root or `CAP_NET_BIND_SERVICE`:
+(see below) - no reverse proxy needed. It also opens a batch of fake
+internal-service ports (databases, caches, remote admin, container APIs -
+see [below](#exposed-internal-services)), three of which (21, 23, 25) are
+also privileged. Binding privileged ports on Linux requires root or
+`CAP_NET_BIND_SERVICE`; any fake-service port that's already taken by a
+real service on the host is logged and skipped rather than treated as
+fatal:
 
 ```sh
 sudo ./vulnapp-web
@@ -126,9 +131,59 @@ sudo ./vulnapp-web-vX.Y.Z-linux-amd64
 | Predictable password reset token | `/forgot-password`, `/reset-password` | 6-digit code from `math/rand`, no rate limit, no expiry, printed in the response instead of emailed - brute-forceable and leaked in one step |
 | JWT forgery via leaked secret | `/login` ("remember me") -> `/api/me` | Signed with the exact secret `/api/config` leaks as `jwt_secret`; `keyFunc` never checks `token.Method`, the classic alg-confusion-enabling pattern |
 | Unchecked array index (CWE-129) | `/api/related?index=` | Any `index` outside `[0,3)` panics (recovered safely) - the kind of crash a basic fuzzer finds in seconds |
+| Exposed profiling endpoint | `/debug/pprof/` | Standard `net/http/pprof`, wired in on purpose - goroutine stacks, heap profile, command line, all public |
+| API discovery document | `/swagger.json` | Lists every endpoint in the app, including the ones nothing on the site links to |
+| Mass assignment (CWE-915) | `PUT`/`PATCH /api/profile` | Request body decodes straight onto the `User` struct; sending `{"role":"admin"}` escalates your own account - and the response echoes the plaintext password back too |
+| Unrestricted file upload (CWE-434) | `POST /upload` -> `/uploads/user/<name>` | No type/extension allowlist; upload an `.html` file with a `<script>` tag and it's served back with a sniffed `text/html` content type - stored XSS |
+| CSP present but useless | every page | `default-src *; script-src * 'unsafe-inline' 'unsafe-eval'` - blocks nothing, looks like a control |
+| Cacheable sensitive responses | `/profile`, `/api/config` | `Cache-Control: public, max-age=3600` on responses containing PII/secrets |
+| Host header injection | `/forgot-password` | The "reset link" is built from the request's own `Host` header with no allowlist |
+| Git reflog exposure | `/.git/logs/HEAD` | A commit message that confesses to a leaked (fake) credential |
 
 See [`handlers.go`](handlers.go) for the implementation of each, and
 [`decoy.go`](decoy.go) for the fake path-traversal fingerprints.
+
+## Exposed internal services
+
+Past the web app itself, the binary also opens a batch of ports that, in
+a real deployment, should never be reachable - the network-level version
+of the same idea, for port scanners (nmap, masscan) and recon tooling
+(Shodan-style dorking) to find. None of these implement the real
+protocol beyond a first-contact banner or response; see
+[`fakeservices.go`](fakeservices.go).
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 21 | FTP (vsFTPd 2.3.4) | Real banner on connect |
+| 23 | Telnet | Real banner on connect |
+| 25 | SMTP (Postfix) | Real banner on connect |
+| 3306 | MySQL 5.5.8 | Real binary protocol greeting packet |
+| 6379 | Redis 2.8.4 | Replies `+PONG` to `PING`, a fake `INFO` block to `INFO` |
+| 11211 | Memcached 1.4.15 | Replies to the `version` command |
+| 9200 | Elasticsearch 1.4.2 | Full fake HTTP root response (real unauth-RCE-history version) |
+| 2375 | Docker Engine API (no TLS) | Full fake HTTP `/version` response |
+| 5984 | CouchDB 1.6.1 | Full fake HTTP root response |
+| 8500 | Consul 0.7.0 | Full fake HTTP agent-self response |
+| 5432, 1433, 3389, 5900, 27017 | PostgreSQL, MSSQL, RDP, VNC, MongoDB | Port accepts the connection and stays silent - protocol-accurate, since real clients speak first on all five |
+
+Plus a batch of ops/dev tooling - the single most common way this class
+of service actually ends up reachable: someone spins it up for a quick
+look and forgets it's there.
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 3000 | Grafana 6.4.3 | Fake `/api/health` response |
+| 5601 | Kibana 6.4.3 | Fake `/api/status`-style response |
+| 9090 | Prometheus | Real `/-/healthy` liveness text |
+| 15672 | RabbitMQ Management | Models the real default-creds misconfig: 401 unless `guest:guest`, then the overview JSON |
+| 8086 | InfluxDB 1.3.1 | Real `/ping` behavior: 204, no body, version header only |
+| 8200 | HashiCorp Vault | Fake `/v1/sys/health` reporting unsealed + active |
+| 8888 | Jupyter Notebook | No-token misconfig: API reachable with zero auth, same as the real RCE-enabling case |
+| 10000 | Webmin 1.580 | Login page naming the exact version with a real unauthenticated-RCE CVE (2019-15107) |
+| 8761 | Netflix Eureka | Fake service registry listing "internal" hosts - reuses the same fake IPs as `/api/config` |
+| 8080 | Jenkins (anonymous access) | Fake dashboard + a `/script` Groovy console page - the classic exposed-Jenkins RCE vector |
+| 9000 | Portainer | `Authentication:false` in the fake API response - the real smoking gun for an unsecured instance |
+| 19999 | Netdata | Fake `/api/v1/info` leaking hostname/OS/kernel/hardware - matches the real default (no auth) |
 
 ## What different kinds of scanners will find
 
@@ -183,12 +238,12 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **43 findings across 15 rule IDs**, including:
+reports **62 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|
 | G701 (CWE-89) | SQL injection | `handleLoginSQLi`, `handleProductsSQLi` (`fmt.Sprintf` straight into a query) |
-| G705 (CWE-79) | XSS sink | every unescaped `fmt.Fprintf` into an HTML response (13 hits) |
+| G705 (CWE-79) | XSS sink | every unescaped `fmt.Fprintf` into an HTML response (16 hits) |
 | G708 (CWE-94) | Server-side template injection | `handleRenderSSTI` |
 | G704 (CWE-918) | SSRF | `handleFetchSSRF` |
 | G710 | Open redirect | `handleOpenRedirect` |
@@ -197,9 +252,12 @@ reports **43 findings across 15 rule IDs**, including:
 | G501/G401 (CWE-327/328) | Weak crypto primitive (MD5) | `gravatarHash` |
 | G101 (CWE-798) | Hardcoded credentials | `store.go`, `decoy.go`, `/api/config`, `/internal/metadata` literals |
 | G124 (CWE-614) | Cookie missing `Secure`/`HttpOnly` | the `role`/`username`/`remember_token` cookies |
-| G706 (CWE-117) | Log injection | `logMiddleware`'s unsanitized `log.Printf` of the request path |
-| G112/G114 (CWE-400/676) | No read/header timeout on `http.Server` (Slowloris-class) | `main.go`'s HTTP and HTTPS listeners |
-| G104 (CWE-703) | Unchecked errors | scattered throughout (10 hits) |
+| G706 (CWE-117) | Log injection | `logMiddleware`'s unsanitized `log.Printf` of the request path/IP |
+| G112/G114 (CWE-400/676) | No read/header timeout on `http.Server` (Slowloris-class) | `main.go`'s and `fakeservices.go`'s HTTP listeners |
+| G117 (CWE-499) | Secret-shaped field marshaled into a JSON response | `handleProfileUpdateMassAssignment` echoes `User.Password` back |
+| G120 (CWE-400) | Unbounded multipart form parsing | `handleUpload` |
+| G115 (CWE-190) | Int->byte conversion that could overflow | `mysqlGreetingPacket`'s length prefix |
+| G104 (CWE-703) | Unchecked errors | scattered throughout (20 hits) |
 
 Run it yourself: `gosec ./...`.
 
@@ -224,8 +282,6 @@ Run it yourself: `gosec ./...`.
 
 ## Design notes
 
-## Design notes
-
 - **Self-contained binary.** Static assets, upload decoys, and the fake
   `.env` are embedded via `go:embed` ([`assets.go`](assets.go)); there's an
   in-memory SQLite database ([`store.go`](store.go)) seeded with fake data.
@@ -233,8 +289,11 @@ Run it yourself: `gosec ./...`.
 - **Nothing here can meaningfully harm the host.** Command injection and
   path traversal are faked (no real shell exec, no real filesystem
   access); the one feature that makes a real network call (SSRF via
-  `/fetch`) is timeout- and size-bounded; the one panic (`/crash`) is
-  recovered.
+  `/fetch`) is timeout- and size-bounded; every panic (`/crash`,
+  `/api/related`) is recovered; file uploads are held in memory only and
+  capped at 5MB; every fake service in `fakeservices.go` only ever reads
+  from or writes a fixed banner/response to the socket - none of them
+  parse, store, or act on what a client sends.
 - **TLS.** No cert/key files needed: the HTTPS listener mints a self-signed
   certificate in memory for whatever hostname a client asks for via SNI,
   caching it per hostname ([`tls.go`](tls.go)). Browsers and scanners will

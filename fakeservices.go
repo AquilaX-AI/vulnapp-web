@@ -1,0 +1,402 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// startFakeServices binds a set of commonly internet-facing-but-shouldn't
+// be ports - the same "exposed management/database interface" category a
+// network/recon scanner (nmap, masscan, Shodan-style tooling) checks for -
+// each giving back just enough of a real banner or response to be
+// fingerprinted. None of these implement the real protocol beyond that:
+// there's no auth to bypass and no backing data store, just a TCP or
+// HTTP listener that answers the way the real thing would on first
+// contact. Binding is best-effort - if a port is already taken (e.g. a
+// real service on that port on this host), it's logged and skipped
+// rather than treated as fatal, since none of these are essential to the
+// app's main purpose.
+func startFakeServices() {
+	// Plaintext/line-based protocols: old, vulnerable-sounding version
+	// strings on purpose, matching the rest of the app's "ancient stack"
+	// theme.
+	startBannerService(":21", "220 (vsFTPd 2.3.4)\r\n", nil)
+	startBannerService(":23", "Ubuntu 16.04.6 LTS\r\nacme-web01 login: ", nil)
+	startBannerService(":25", "220 mail.acme-supplies.internal ESMTP Postfix (Ubuntu)\r\n", nil)
+	startBannerService(":6379", "", redisReply)
+	startBannerService(":11211", "", memcachedReply)
+	startMySQLService(":3306") // binary greeting, not a plain-text banner
+
+	// Protocols where the client speaks first (PostgreSQL, MSSQL, RDP,
+	// VNC, MongoDB): accepting the connection and staying silent is
+	// actually protocol-accurate, and still enough for a port scanner to
+	// mark the port "open".
+	for _, addr := range []string{":5432", ":1433", ":3389", ":5900", ":27017"} {
+		startSilentService(addr)
+	}
+
+	// HTTP-based fake services: these products genuinely just speak
+	// plain HTTP, so a tiny handler is a faithful (if minimal) fake -
+	// each with an old-ish, real version number with its own history of
+	// CVEs, same as the rest of the app.
+	startFakeHTTPService(":9200", handleFakeElasticsearch)
+	startFakeHTTPService(":2375", handleFakeDockerAPI)
+	startFakeHTTPService(":5984", handleFakeCouchDB)
+	startFakeHTTPService(":8500", handleFakeConsul)
+
+	// The "ops tooling someone spun up and forgot about" category - the
+	// single most common way this stuff actually ends up exposed in the
+	// real world, so it gets the biggest slice of ports.
+	startFakeHTTPService(":3000", handleFakeGrafana)
+	startFakeHTTPService(":5601", handleFakeKibana)
+	startFakeHTTPService(":9090", handleFakePrometheus)
+	startFakeHTTPService(":15672", handleFakeRabbitMQ)
+	startFakeHTTPService(":8086", handleFakeInfluxDB)
+	startFakeHTTPService(":8200", handleFakeVault)
+	startFakeHTTPService(":8888", handleFakeJupyter)
+	startFakeHTTPService(":10000", handleFakeWebmin)
+	startFakeHTTPService(":8761", handleFakeEureka)
+	startFakeHTTPService(":8080", handleFakeJenkins)
+	startFakeHTTPService(":9000", handleFakePortainer)
+	startFakeHTTPService(":19999", handleFakeNetdata)
+}
+
+func startBannerService(addr, banner string, reply func(string) string) {
+	if banner == "" && reply == nil {
+		return
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	go acceptLoop(ln, func(conn net.Conn) {
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		if banner != "" {
+			conn.Write([]byte(banner))
+		}
+		if reply == nil {
+			return
+		}
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			if resp := reply(scanner.Text()); resp != "" {
+				conn.Write([]byte(resp))
+			}
+		}
+	})
+}
+
+func startSilentService(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	go acceptLoop(ln, func(conn net.Conn) {
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		buf := make([]byte, 1024)
+		conn.Read(buf) // nolint - discard whatever the client sends, never reply
+	})
+}
+
+func acceptLoop(ln net.Listener, handle func(net.Conn)) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go handle(conn)
+	}
+}
+
+// redisReply mimics just enough of Redis's inline command protocol for a
+// liveness/fingerprint check (PING -> +PONG) and a basic INFO probe
+// (reporting a real, old Redis version) to succeed.
+func redisReply(line string) string {
+	upper := strings.ToUpper(strings.TrimSpace(line))
+	if strings.Contains(upper, "INFO") {
+		info := "# Server\r\nredis_version:2.8.4\r\nos:Linux 4.4.0-x86_64\r\n"
+		return fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+	}
+	return "+PONG\r\n"
+}
+
+// memcachedReply answers the classic "version" probe; anything else gets
+// a generic protocol error, same as the real thing.
+func memcachedReply(line string) string {
+	if strings.HasPrefix(strings.TrimSpace(line), "version") {
+		return "VERSION 1.4.15\r\n"
+	}
+	return "ERROR\r\n"
+}
+
+// startMySQLService sends the real MySQL wire protocol's initial
+// handshake packet immediately on connect (that's genuinely how MySQL
+// greets a client) with an old, real server version string - enough for
+// nmap's mysql-info or a manual banner grab to identify it. Whatever the
+// client sends back (its auth response) is never read or answered.
+func startMySQLService(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	greeting := mysqlGreetingPacket()
+	go acceptLoop(ln, func(conn net.Conn) {
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		conn.Write(greeting)
+	})
+}
+
+func mysqlGreetingPacket() []byte {
+	serverVersion := "5.5.8-log\x00"
+	threadID := []byte{0x01, 0x00, 0x00, 0x00}
+	authPluginData1 := []byte{0x3a, 0x40, 0x3f, 0x5a, 0x21, 0x5e, 0x4a, 0x21}
+	capabilityLower := []byte{0xff, 0xf7}
+	charset := byte(0x08)
+	statusFlags := []byte{0x02, 0x00}
+	capabilityUpper := []byte{0x00, 0x00}
+	authPluginDataLen := byte(0x00)
+	reserved := make([]byte, 10)
+	authPluginData2 := make([]byte, 12)
+
+	var payload []byte
+	payload = append(payload, 0x0a) // protocol version 10
+	payload = append(payload, []byte(serverVersion)...)
+	payload = append(payload, threadID...)
+	payload = append(payload, authPluginData1...)
+	payload = append(payload, 0x00) // filler
+	payload = append(payload, capabilityLower...)
+	payload = append(payload, charset)
+	payload = append(payload, statusFlags...)
+	payload = append(payload, capabilityUpper...)
+	payload = append(payload, authPluginDataLen)
+	payload = append(payload, reserved...)
+	payload = append(payload, authPluginData2...)
+
+	length := len(payload)
+	header := []byte{byte(length), byte(length >> 8), byte(length >> 16), 0x00}
+	return append(header, payload...)
+}
+
+func startFakeHTTPService(addr string, handler http.HandlerFunc) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	srv := &http.Server{Handler: handler}
+	go func() {
+		if err := srv.Serve(ln); err != nil {
+			log.Printf("fake service %s stopped: %v", addr, err)
+		}
+	}()
+}
+
+// handleFakeElasticsearch mimics Elasticsearch 1.4.2's unauthenticated
+// root endpoint - the exact real-world "found an open Elasticsearch on
+// the internet" fingerprint, right down to a version with its own real
+// CVE history (e.g. the Groovy scripting RCEs).
+func handleFakeElasticsearch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "name" : "acme-es-node-1",
+  "cluster_name" : "acme-supplies",
+  "version" : {
+    "number" : "1.4.2",
+    "build_hash" : "927caff6f05403e936c20bf4529f144f0c89fd9",
+    "build_timestamp" : "2014-12-16T14:11:12Z",
+    "build_snapshot" : false,
+    "lucene_version" : "4.10.2"
+  },
+  "tagline" : "You Know, for Search"
+}`)
+}
+
+// handleFakeDockerAPI mimics an exposed, unauthenticated Docker Engine
+// API - a real, commonly-exploited misconfiguration (remote code
+// execution via container creation) when left reachable without TLS.
+func handleFakeDockerAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "Version": "1.12.6",
+  "ApiVersion": "1.24",
+  "GitCommit": "78d1802",
+  "GoVersion": "go1.6.4",
+  "Os": "linux",
+  "Arch": "amd64",
+  "KernelVersion": "4.4.0-104-generic"
+}`)
+}
+
+func handleFakeCouchDB(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"couchdb":"Welcome","version":"1.6.1","vendor":{"name":"Ubuntu","version":"16.04"}}`)
+}
+
+// handleFakeConsul mimics Consul's unauthenticated agent self-info
+// endpoint, reusing the same internal IP already leaked by /api/config
+// for a consistent story.
+func handleFakeConsul(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "Config": {"Datacenter": "dc1", "NodeName": "acme-consul-01", "Server": true, "Version": "0.7.0"},
+  "Member": {"Name": "acme-consul-01", "Addr": "10.0.4.23"}
+}`)
+}
+
+// ---------------------------------------------------------------------
+// Ops/dev tooling that gets spun up for a quick look and then forgotten -
+// the single most common real way this class of service ends up
+// reachable from the internet. Same deal as above: a faithful-looking
+// first response, no real backend behind it.
+// ---------------------------------------------------------------------
+
+func handleFakeGrafana(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"commit":"4f8f3d5","database":"ok","version":"6.4.3"}`)
+}
+
+func handleFakeKibana(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "name": "acme-kibana",
+  "version": {"number": "6.4.3"},
+  "status": {"overall": {"state": "green"}}
+}`)
+}
+
+// handleFakePrometheus answers the real /-/healthy liveness probe, and
+// falls back to the same text for anything else - Prometheus's actual
+// root page is a full React app, not worth faking byte-for-byte.
+func handleFakePrometheus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, "Prometheus Server is Healthy.\n")
+}
+
+// handleFakeRabbitMQ models the real default-credentials misconfig:
+// RabbitMQ management ships with guest/guest, meant to be usable only
+// from localhost - plenty of deployments leave that restriction off too.
+// Any other (or missing) credentials get the real 401 challenge.
+func handleFakeRabbitMQ(w http.ResponseWriter, r *http.Request) {
+	user, pass, ok := r.BasicAuth()
+	if !ok || user != "guest" || pass != "guest" {
+		w.Header().Set("WWW-Authenticate", `Basic realm="RabbitMQ Management"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"rabbitmq_version":"3.6.6","management_version":"3.6.6","cluster_name":"rabbit@acme-mq01"}`)
+}
+
+// handleFakeInfluxDB mimics the real /ping endpoint: 204, no body, just
+// a version header - that's genuinely all InfluxDB sends back.
+func handleFakeInfluxDB(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Influxdb-Version", "1.3.1")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleFakeVault mimics an unsealed, active Vault's /v1/sys/health -
+// which, unlike almost everything else here, is meant to be reachable
+// without auth. The real finding is that it's unsealed and reachable at
+// all from wherever the scanner is sitting.
+func handleFakeVault(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"initialized":true,"sealed":false,"standby":false,"version":"0.6.4","cluster_name":"vault-cluster-acme"}`)
+}
+
+// handleFakeJupyter models the actual vulnerable misconfiguration (not
+// just an exposed port): a notebook server with no token/password set,
+// so its API is reachable with no auth at all - from here, a real
+// Jupyter lets you create a notebook and execute arbitrary code.
+func handleFakeJupyter(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", "TornadoServer/6.0.4")
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[]`)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Home Page - Select or create a notebook</title></head>
+<body>Jupyter Notebook (no login required)</body></html>`)
+}
+
+// handleFakeWebmin plays on a real, specific CVE (2019-15107, RCE via
+// the password-reset feature in Webmin <= 1.920's default build) by
+// naming the exact vulnerable version in the page, the same way
+// /phpinfo.php does for its fake PHP.
+func handleFakeWebmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Login to Webmin</title></head>
+<body>
+<h1>Login to Webmin</h1>
+<form method="post"><input name="user"><input name="pass" type="password"><button>Login</button></form>
+<p><small>Webmin version 1.580</small></p>
+</body></html>`)
+}
+
+// handleFakeEureka mimics an exposed Netflix Eureka service registry -
+// reusing the same internal IPs already leaked by /api/config and
+// /internal/metadata, so an SSRF chain through here reaches "real"
+// (fake) internal hosts.
+func handleFakeEureka(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "applications": {
+    "application": [
+      {"name": "ACME-ORDERS", "instance": [{"instanceId": "orders-01", "ipAddr": "10.0.4.23", "port": {"$": 8080}}]},
+      {"name": "ACME-AUTH", "instance": [{"instanceId": "auth-01", "ipAddr": "192.168.56.10", "port": {"$": 8081}}]}
+    ]
+  }
+}`)
+}
+
+// handleFakeJenkins models the classic worst case: anonymous read/admin
+// left on, so the Groovy script console - genuinely arbitrary code
+// execution on a real Jenkins - is reachable with no login at all. The
+// console page here is just a static form; nothing it "submits" is ever
+// executed.
+func handleFakeJenkins(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Jenkins", "2.46.1")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if r.URL.Path == "/script" {
+		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Script Console</title></head>
+<body><h1>Script Console</h1><form method="post"><textarea name="script" rows="10" cols="80"></textarea><br><button>Run</button></form></body></html>`)
+		return
+	}
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Dashboard [Jenkins]</title></head>
+<body><h1>Dashboard</h1><p>Welcome to Jenkins (anonymous access)</p></body></html>`)
+}
+
+// handleFakePortainer's "Authentication":false is the real smoking gun
+// Portainer itself exposes when someone skipped setting an admin
+// password - anonymous full control over every container on the host.
+func handleFakePortainer(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"Authentication":false,"EndpointManagement":true,"Analytics":true,"Version":"1.24.1"}`)
+}
+
+// handleFakeNetdata mimics Netdata's unauthenticated-by-default info
+// API, which happily leaks real hostnames, OS/kernel versions, and
+// hardware specs to anyone who asks.
+func handleFakeNetdata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "version": "v1.19.0",
+  "hostname": "acme-web01",
+  "os_name": "Ubuntu",
+  "os_version": "16.04.6 LTS",
+  "kernel_version": "4.4.0-104-generic",
+  "cores_total": 4,
+  "ram_total": 8589934592
+}`)
+}
