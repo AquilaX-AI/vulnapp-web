@@ -455,6 +455,10 @@ func handleProfileIDOR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	// Sensitive, per-user PII, cacheable by any shared proxy/CDN in front
+	// of this for an hour - a different (and worse) finding than simply
+	// having no Cache-Control header at all.
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 
 	usersMu.Lock()
 	defer usersMu.Unlock()
@@ -558,6 +562,7 @@ func handleAdminBrokenAccess(w http.ResponseWriter, r *http.Request) {
 func handleAPIConfigExposure(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Api-Key", "sk_live_FAKE1234567890abcdef")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	json.NewEncoder(w).Encode(map[string]any{
 		"debug":            true,
 		"version":          "0.1.0-dev",
@@ -873,16 +878,24 @@ func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
 	resetTokens[username] = code
 	resetTokensMu.Unlock()
 
-	// A real app would email this. This one just prints it on screen -
-	// another intentional information-disclosure shortcut.
+	// Host header injection: the "link we'd email you" is built from the
+	// request's own Host header with no validation against an allowlist.
+	// A real app that actually emails this would let an attacker who can
+	// set an arbitrary Host header (trivial - it's just a request header)
+	// redirect a victim's password-reset flow to a domain of their
+	// choosing, leaking the code when the victim clicks it.
+	resetLink := fmt.Sprintf("https://%s/reset-password?username=%s&code=%s", r.Host, username, code)
+
+	// A real app would email this instead of printing it on screen -
+	// that part's a separate, intentional information-disclosure shortcut.
 	fmt.Fprintf(w, `<h1>Reset code sent</h1>
-<p>(Demo shortcut: your code is <b>%s</b> - a real app would email this instead.)</p>
+<p>(Demo shortcut: your code is <b>%s</b> - a real app would email you this link instead: <code>%s</code>)</p>
 <form action="/reset-password" method="post">
   <input type="hidden" name="username" value="%s">
   <input name="code" placeholder="6-digit code">
   <input name="new_password" type="password" placeholder="New password">
   <button class="btn">Reset password</button>
-</form>`, code, username)
+</form>`, code, resetLink, username)
 	fmt.Fprint(w, pageFooter)
 }
 

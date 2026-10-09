@@ -54,6 +54,11 @@ func main() {
 	}
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServerFS(uploadsSub)))
 
+	// Unrestricted file upload: more specific than "/uploads/" above, so
+	// it wins for this one subpath. No type/extension checks at all.
+	mux.HandleFunc("/upload", handleUpload)
+	mux.HandleFunc("/uploads/user/", handleServeUpload)
+
 	// .env served directly at the web root for maximum DAST-discoverability.
 	mux.HandleFunc("/.env", handleEnvFile)
 
@@ -61,14 +66,24 @@ func main() {
 	// a very common real-world recon source.
 	mux.HandleFunc("/robots.txt", handleRobotsTxt)
 
-	// Fake exposed .git metadata, with a credential leaked in the remote URL.
+	// A fake OpenAPI spec is an even better recon source than robots.txt:
+	// it names every endpoint, including the ones nothing on the site
+	// links to.
+	mux.HandleFunc("/swagger.json", handleSwaggerJSON)
+
+	// Fake exposed .git metadata, with a credential leaked in the remote
+	// URL and a reflog entry confessing to another one.
 	mux.HandleFunc("/.git/HEAD", handleGitHead)
 	mux.HandleFunc("/.git/config", handleGitConfig)
+	mux.HandleFunc("/.git/logs/HEAD", handleGitLogsHead)
 
 	// Fake leftover PHP backup/debug files, consistent with the Server /
 	// X-Powered-By banner above.
 	mux.HandleFunc("/config.php.bak", handleConfigPhpBak)
 	mux.HandleFunc("/phpinfo.php", handlePhpInfo)
+
+	// Exposed pprof - the classic real-world Go misconfiguration.
+	registerPprof(mux)
 
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/search", handleSearchXSS)
@@ -86,6 +101,7 @@ func main() {
 	mux.HandleFunc("/api/data", handleAPIDataCORS)
 	mux.HandleFunc("/api/me", handleAPIMe)
 	mux.HandleFunc("/api/related", handleRelatedProductCrash)
+	mux.HandleFunc("/api/profile", handleProfileUpdateMassAssignment)
 	mux.HandleFunc("/ping", handlePingCmdInjection)
 	mux.HandleFunc("/render", handleRenderSSTI)
 	mux.HandleFunc("/transfer", handleTransferCSRF)
@@ -139,19 +155,24 @@ func getenvDefault(key, fallback string) string {
 	return fallback
 }
 
-// logMiddleware logs each request. It intentionally does not set any
-// security headers (no CSP, X-Frame-Options, HSTS, X-Content-Type-Options),
+// logMiddleware logs each request. It intentionally does not set most
+// security headers (no X-Frame-Options, HSTS, or X-Content-Type-Options),
 // which is itself one of the vulnerable findings (clickjacking / missing
-// hardening headers).
+// hardening headers). The one header it does set, CSP, is deliberately
+// useless - "present but ineffective" is a distinct finding from
+// "missing entirely".
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.String())
+		log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.String())
 		// Verbose, deliberately outdated server banner disclosure: this is
 		// a Go binary, but it claims to be a long-EOL Apache/PHP stack so
 		// scanners that fingerprint software versions have something to
 		// flag (and, if they check, plenty of known CVEs to suggest).
 		w.Header().Set("Server", "Apache/2.2.15 (CentOS)")
 		w.Header().Set("X-Powered-By", "PHP/5.3.3")
+		// A wildcard, 'unsafe-inline'/'unsafe-eval' CSP blocks nothing -
+		// it just looks like a security control to anyone not reading it.
+		w.Header().Set("Content-Security-Policy", "default-src *; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'")
 		next.ServeHTTP(w, r)
 	})
 }
