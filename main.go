@@ -19,6 +19,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io/fs"
 	"log"
@@ -56,10 +57,25 @@ func main() {
 	// .env served directly at the web root for maximum DAST-discoverability.
 	mux.HandleFunc("/.env", handleEnvFile)
 
+	// robots.txt that points a crawler straight at the "sensitive" areas -
+	// a very common real-world recon source.
+	mux.HandleFunc("/robots.txt", handleRobotsTxt)
+
+	// Fake exposed .git metadata, with a credential leaked in the remote URL.
+	mux.HandleFunc("/.git/HEAD", handleGitHead)
+	mux.HandleFunc("/.git/config", handleGitConfig)
+
+	// Fake leftover PHP backup/debug files, consistent with the Server /
+	// X-Powered-By banner above.
+	mux.HandleFunc("/config.php.bak", handleConfigPhpBak)
+	mux.HandleFunc("/phpinfo.php", handlePhpInfo)
+
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/search", handleSearchXSS)
 	mux.HandleFunc("/comments", handleComments)
 	mux.HandleFunc("/login", handleLoginSQLi)
+	mux.HandleFunc("/forgot-password", handleForgotPassword)
+	mux.HandleFunc("/reset-password", handleResetPassword)
 	mux.HandleFunc("/products", handleProductsSQLi)
 	mux.HandleFunc("/files", handleFilesTraversal)
 	mux.HandleFunc("/redirect", handleOpenRedirect)
@@ -68,6 +84,8 @@ func main() {
 	mux.HandleFunc("/admin", handleAdminBrokenAccess)
 	mux.HandleFunc("/api/config", handleAPIConfigExposure)
 	mux.HandleFunc("/api/data", handleAPIDataCORS)
+	mux.HandleFunc("/api/me", handleAPIMe)
+	mux.HandleFunc("/api/related", handleRelatedProductCrash)
 	mux.HandleFunc("/ping", handlePingCmdInjection)
 	mux.HandleFunc("/render", handleRenderSSTI)
 	mux.HandleFunc("/transfer", handleTransferCSRF)
@@ -75,7 +93,7 @@ func main() {
 	mux.HandleFunc("/internal/metadata", handleInternalMetadata)
 	mux.HandleFunc("/crash", handleCrashStackTrace)
 
-	handler := recoverMiddleware(logMiddleware(mux))
+	handler := recoverMiddleware(logMiddleware(methodProbeMiddleware(mux)))
 
 	fmt.Printf("vulnapp-web %s\n", version)
 
@@ -99,6 +117,13 @@ func main() {
 			Addr:      httpsAddr,
 			Handler:   handler,
 			TLSConfig: tlsConfig,
+			// HTTP/2 requires at least one ECDHE+AES-GCM cipher suite,
+			// which our deliberately weak, RSA-key-exchange-only
+			// CipherSuites list doesn't offer - Go refuses to start
+			// otherwise. Disabling h2 here is also period-accurate: the
+			// Apache 2.2/PHP 5.3 stack this app pretends to be predates
+			// HTTP/2 entirely.
+			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 		}
 		fmt.Printf("vulnapp-web listening on https://%s (self-signed certificate, minted per-hostname on connect, intentionally vulnerable - do not expose publicly)\n", httpsAddr)
 		errCh <- srv.ListenAndServeTLS("", "")
@@ -121,8 +146,35 @@ func getenvDefault(key, fallback string) string {
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
-		// Verbose server banner disclosure.
-		w.Header().Set("Server", "vulnapp-web/0.1 (Go net/http)")
+		// Verbose, deliberately outdated server banner disclosure: this is
+		// a Go binary, but it claims to be a long-EOL Apache/PHP stack so
+		// scanners that fingerprint software versions have something to
+		// flag (and, if they check, plenty of known CVEs to suggest).
+		w.Header().Set("Server", "Apache/2.2.15 (CentOS)")
+		w.Header().Set("X-Powered-By", "PHP/5.3.3")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// methodProbeMiddleware answers HTTP methods that a hardened server would
+// normally reject. TRACE gets the classic Cross-Site Tracing (XST)
+// treatment - naively reflecting the raw request back instead of
+// rejecting it - and OPTIONS advertises a broad, unrestricted Allow list.
+// Everything else just falls through to the normal handler, which is
+// itself already method-agnostic (another intentional "insecure HTTP
+// methods" finding: GET, PUT, DELETE, PATCH, ... all behave the same).
+func methodProbeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodTrace:
+			w.Header().Set("Content-Type", "message/http")
+			r.Write(w)
+			return
+		case http.MethodOptions:
+			w.Header().Set("Allow", "GET, HEAD, POST, PUT, DELETE, PATCH, TRACE, CONNECT, OPTIONS")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }

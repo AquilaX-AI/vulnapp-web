@@ -35,10 +35,31 @@ func certSource() (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: weakMinVersion, MaxVersion: weakMaxVersion, CipherSuites: weakCipherSuites}, nil
 	}
-	return &tls.Config{GetCertificate: getCertificateForClient}, nil
+	return &tls.Config{GetCertificate: getCertificateForClient, MinVersion: weakMinVersion, MaxVersion: weakMaxVersion, CipherSuites: weakCipherSuites}, nil
 }
+
+// Deliberately weak TLS policy, for TLS-scanning tools (testssl.sh,
+// sslyze, Qualys SSL Labs, nmap --script ssl-enum-ciphers, ...) to find:
+// TLS 1.0/1.1 are re-enabled (Go's own default floor is TLS 1.2), capped
+// at TLS 1.2 so this list of cipher suites is actually what gets
+// negotiated (TLS 1.3's suites aren't configurable in Go and are always
+// strong), and every suite here uses plain RSA key exchange - no ECDHE -
+// so none of them provide forward secrecy, and several are CBC-mode
+// (BEAST/Lucky13-family weaknesses). This is also a classic SAST finding
+// on its own (e.g. gosec G402 "TLS MinVersion too low").
+var (
+	weakMinVersion uint16 = tls.VersionTLS10
+	weakMaxVersion uint16 = tls.VersionTLS12
+	weakCipherSuites       = []uint16{
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	}
+)
 
 var (
 	hostKeyOnce sync.Once

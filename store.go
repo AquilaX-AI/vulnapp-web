@@ -44,7 +44,22 @@ var (
 	// Resets to 1000 whenever the process restarts; no real money or
 	// persistence is involved.
 	balance = 1000
+
+	usersMu sync.Mutex
+
+	// resetTokens backs the weak password-reset flow: username -> a
+	// predictable 6-digit code generated with math/rand (see
+	// handleForgotPassword). Brute-forceable in well under a million
+	// guesses - exactly what a fuzzer/intruder would find quickly.
+	resetTokensMu sync.Mutex
+	resetTokens   = map[string]string{}
 )
+
+// jwtSecret signs the "remember me" token (see handleLoginSQLi /
+// handleAPIMe) and is also - deliberately - the exact same value leaked
+// by /api/config's "jwt_secret" field, so reading that endpoint is enough
+// to forge a token for any user/role.
+const jwtSecret = "changeme"
 
 var fakeUsers = []User{
 	{1, "admin", "SuperSecretPass!2024", "admin", "admin@vulnapp.local", "000-00-0001", "1 Admin Way, HQ"},

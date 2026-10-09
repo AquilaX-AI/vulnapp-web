@@ -1,16 +1,21 @@
 package main
 
 import (
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/dgrijalva/jwt-go"
 )
 
 // ---------------------------------------------------------------------
@@ -31,6 +36,7 @@ func pageHeader(title string) string {
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
   <!-- maintenance: temporary admin login left enabled for the launch team, admin / SuperSecretPass!2024 - remove before go-live -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 </head>
 <body>
 <header class="site-header">
@@ -47,6 +53,18 @@ func pageHeader(title string) string {
 </header>
 <main class="wrap">
 `, title)
+}
+
+// sqlErrorBanner renders a database error the way a naive PHP/MySQL app
+// from the Server banner's era would: the raw driver error, wrapped in a
+// classic, instantly-recognizable MySQL warning line and a file path, so
+// even a scanner that just greps for known error-disclosure signatures
+// (rather than actually parsing SQLite's own error format) picks it up.
+func sqlErrorBanner(file string, err error) string {
+	return fmt.Sprintf(
+		"<pre>Warning: mysql_fetch_array(): supplied argument is not a valid MySQL result resource in %s\n\n%s</pre>",
+		file, err.Error(),
+	)
 }
 
 const pageFooter = `
@@ -201,8 +219,10 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 <form action="/login" method="post">
   <input name="username" placeholder="Username">
   <input name="password" type="password" placeholder="Password">
+  <label><input type="checkbox" name="remember" value="1"> Remember me</label>
   <button class="btn">Sign in</button>
-</form>`)
+</form>
+<p><a href="/forgot-password">Forgot your password?</a></p>`)
 		fmt.Fprint(w, pageFooter)
 		return
 	}
@@ -219,7 +239,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(query)
 	if err != nil {
 		// Error-based SQLi: the raw database error is reflected back.
-		fmt.Fprintf(w, "<pre>Sign-in failed: %s</pre>", err.Error())
+		fmt.Fprint(w, sqlErrorBanner("/var/www/html/login.php", err))
 		fmt.Fprint(w, pageFooter)
 		return
 	}
@@ -235,6 +255,24 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "role", Value: role})
 		http.SetCookie(w, &http.Cookie{Name: "username", Value: uname})
 
+		if r.FormValue("remember") != "" {
+			// "Remember me" token: signed with the same weak, hardcoded
+			// secret that /api/config leaks as "jwt_secret", via a
+			// long-deprecated JWT library with a known signature-forgery
+			// CVE (GO-2020-0017 / CVE-2020-26160). Anyone who reads that
+			// config endpoint can mint their own token for any username
+			// and role.
+			token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"username": uname,
+				"role":     role,
+				"exp":      time.Now().Add(30 * 24 * time.Hour).Unix(),
+			})
+			signed, err := token.SignedString([]byte(jwtSecret))
+			if err == nil {
+				http.SetCookie(w, &http.Cookie{Name: "remember_token", Value: signed})
+			}
+		}
+
 		fmt.Fprintf(w, `<h1>Welcome back, %s</h1><p><a href="/account?id=%d">Go to my account</a></p>`, uname, id)
 		fmt.Fprint(w, pageFooter)
 		return
@@ -245,7 +283,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	existsQuery := fmt.Sprintf("SELECT 1 FROM users WHERE username='%s'", username)
 	existsRows, err := db.Query(existsQuery)
 	if err != nil {
-		fmt.Fprintf(w, "<pre>Sign-in failed: %s</pre>", err.Error())
+		fmt.Fprint(w, sqlErrorBanner("/var/www/html/login.php", err))
 		fmt.Fprint(w, pageFooter)
 		return
 	}
@@ -285,7 +323,7 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query)
 	if err != nil {
-		fmt.Fprintf(w, "<pre>Couldn't load that product: %s</pre>", err.Error())
+		fmt.Fprint(w, sqlErrorBanner("/var/www/html/products.php", err))
 		fmt.Fprint(w, pageFooter)
 		return
 	}
@@ -387,9 +425,18 @@ fetch('/profile?id=%s')
   .then(function(r){ return r.json(); })
   .then(function(d){
     document.getElementById('account').innerHTML =
+      '<img src="https://www.gravatar.com/avatar/' + d.avatar_hash + '?d=mp" width="48" height="48">' +
       '<p>Username: ' + d.username + '</p>' +
       '<p>Email: ' + d.email + '</p>' +
       '<p>Address: ' + d.address + '</p>';
+  });
+fetch('/api/me')
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.username) {
+      document.getElementById('account').innerHTML +=
+        '<p><small>Remembered sign-in: ' + d.username + ' (' + d.role + ')</small></p>';
+    }
   });
 </script>`, id)
 	fmt.Fprint(w, pageFooter)
@@ -409,20 +456,66 @@ func handleProfileIDOR(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
+	usersMu.Lock()
+	defer usersMu.Unlock()
+
 	for _, u := range fakeUsers {
 		if u.ID == id {
 			json.NewEncoder(w).Encode(map[string]any{
-				"id":       u.ID,
-				"username": u.Username,
-				"email":    u.Email,
-				"ssn":      u.SSN,
-				"address":  u.Address,
+				"id":          u.ID,
+				"username":    u.Username,
+				"email":       u.Email,
+				"ssn":         u.SSN,
+				"address":     u.Address,
+				"avatar_hash": gravatarHash(u.Email),
 			})
 			return
 		}
 	}
 	w.WriteHeader(http.StatusNotFound)
 	fmt.Fprint(w, `{"error":"not found"}`)
+}
+
+// gravatarHash mirrors the real Gravatar scheme (MD5 of the lowercased,
+// trimmed email) to build an avatar URL. It's a legitimate, widely-used
+// pattern - and also a textbook "use of a weak cryptographic primitive"
+// finding (gosec G401/G501) for a SAST tool to flag, since MD5 is doing
+// real (if low-stakes) identity work here.
+func gravatarHash(email string) string {
+	sum := md5.Sum([]byte(strings.ToLower(strings.TrimSpace(email))))
+	return hex.EncodeToString(sum[:])
+}
+
+// ---------------------------------------------------------------------
+// "Remember me" JWT: the classic insecure validation pattern. keyFunc
+// hands back the HMAC secret for *any* token without checking
+// token.Method, so a token signed with a different algorithm than the
+// server expects is still accepted as long as the attacker can satisfy
+// whatever keyFunc blindly returns - here that's moot since HS256 with a
+// known/leaked secret is already enough to forge any claim set.
+// ---------------------------------------------------------------------
+
+func handleAPIMe(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	cookie, err := r.Cookie("remember_token")
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"not signed in"}`)
+		return
+	}
+
+	token, err := jwt.Parse(cookie.Value, func(token *jwt.Token) (interface{}, error) {
+		return []byte(jwtSecret), nil
+	})
+	if err != nil || !token.Valid {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintf(w, `{"error":"invalid token: %s"}`, err)
+		return
+	}
+
+	claims, _ := token.Claims.(jwt.MapClaims)
+	json.NewEncoder(w).Encode(claims)
 }
 
 // ---------------------------------------------------------------------
@@ -443,9 +536,11 @@ func handleAdminBrokenAccess(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprint(w, pageHeader("Staff Portal"))
 	fmt.Fprint(w, `<h1>Staff portal</h1><h2>Customers</h2><table border=1><tr><th>ID</th><th>Username</th><th>Password</th><th>Role</th></tr>`)
+	usersMu.Lock()
 	for _, u := range fakeUsers {
 		fmt.Fprintf(w, "<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>", u.ID, u.Username, u.Password, u.Role)
 	}
+	usersMu.Unlock()
 	fmt.Fprint(w, `</table>
 <h2>Import product image</h2>
 <p>Paste a URL and we'll pull the image into the catalog.</p>
@@ -464,11 +559,12 @@ func handleAPIConfigExposure(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Api-Key", "sk_live_FAKE1234567890abcdef")
 	json.NewEncoder(w).Encode(map[string]any{
-		"debug":             true,
-		"version":           "0.1.0-dev",
-		"database_dsn":      "postgres://vulnapp:SuperSecretDBPass!@localhost:5432/vulnapp",
-		"internal_api_key":  "fake-internal-key-7788990011",
-		"jwt_secret":        "changeme",
+		"debug":            true,
+		"version":          "0.1.0-dev",
+		"database_dsn":     "postgres://vulnapp:SuperSecretDBPass!@10.0.4.23:5432/vulnapp",
+		"internal_lb_ip":   "192.168.56.10",
+		"internal_api_key": "fake-internal-key-7788990011",
+		"jwt_secret":       jwtSecret,
 	})
 }
 
@@ -651,4 +747,205 @@ func handleCrashStackTrace(w http.ResponseWriter, r *http.Request) {
 		"unexpected nil config for tenant=%q (dsn=postgres://vulnapp:SuperSecretDBPass!@localhost:5432/vulnapp)",
 		tenant,
 	))
+}
+
+// ---------------------------------------------------------------------
+// robots.txt pointing straight at the "sensitive" areas - a classic
+// recon source that also helps a scanner's spider actually find them.
+// ---------------------------------------------------------------------
+
+func handleRobotsTxt(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, `User-agent: *
+Disallow: /admin
+Disallow: /uploads/
+Disallow: /api/
+Disallow: /internal/
+Disallow: /crash
+Disallow: /.git/
+Disallow: /config.php.bak
+Disallow: /phpinfo.php
+`)
+}
+
+// ---------------------------------------------------------------------
+// Fake exposed .git metadata (source control exposure), with a
+// credential leaked straight in the remote URL.
+// ---------------------------------------------------------------------
+
+func handleGitHead(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, "ref: refs/heads/main\n")
+}
+
+func handleGitConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, `[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = https://admin:SuperSecretPass!2024@github.com/acme-supplies/vulnapp-web-internal.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main
+`)
+}
+
+// ---------------------------------------------------------------------
+// Fake leftover PHP backup/debug files, consistent with the fake
+// Apache/PHP Server and X-Powered-By banner.
+// ---------------------------------------------------------------------
+
+func handleConfigPhpBak(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprint(w, `<?php
+// legacy config, superseded - left here by mistake (fake, for demo purposes)
+define('DB_HOST', 'db.internal');
+define('DB_USER', 'vulnapp');
+define('DB_PASS', 'SuperSecretDBPass!');
+define('SECRET_KEY', 'FakeAppSecretDoNotUseThisIsADemoValue000111222');
+?>
+`)
+}
+
+func handlePhpInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<html><head><title>phpinfo()</title></head><body>
+<h1>PHP Version 5.3.3</h1>
+<table border=1>
+<tr><td>System</td><td>Linux acme-web01 2.6.32-696.el6.x86_64</td></tr>
+<tr><td>Server API</td><td>Apache 2.0 Handler</td></tr>
+<tr><td>DOCUMENT_ROOT</td><td>/var/www/html</td></tr>
+<tr><td>SERVER_SOFTWARE</td><td>Apache/2.2.15 (CentOS)</td></tr>
+<tr><td>DB_PASS</td><td>SuperSecretDBPass!</td></tr>
+<tr><td>allow_url_fopen</td><td>On</td></tr>
+<tr><td>register_globals</td><td>On</td></tr>
+</table>
+</body></html>`)
+}
+
+// ---------------------------------------------------------------------
+// Weak password reset: a predictable 6-digit code generated with
+// math/rand (not crypto/rand - a textbook gosec G404 finding), with no
+// rate limiting and no expiry, so it's brute-forceable in well under a
+// million requests. The "forgot password" step also happily confirms
+// whether the username exists (further username enumeration) and prints
+// the code straight into the response instead of actually emailing it.
+// ---------------------------------------------------------------------
+
+func handleForgotPassword(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Forgot Password"))
+
+	if r.Method != http.MethodPost {
+		fmt.Fprint(w, `<h1>Forgot your password?</h1>
+<form action="/forgot-password" method="post">
+  <input name="username" placeholder="Username">
+  <button class="btn">Send reset code</button>
+</form>`)
+		fmt.Fprint(w, pageFooter)
+		return
+	}
+
+	username := r.FormValue("username")
+
+	usersMu.Lock()
+	found := false
+	for _, u := range fakeUsers {
+		if u.Username == username {
+			found = true
+			break
+		}
+	}
+	usersMu.Unlock()
+
+	if !found {
+		fmt.Fprint(w, "<p>We couldn't find an account with that username.</p>")
+		fmt.Fprint(w, pageFooter)
+		return
+	}
+
+	code := fmt.Sprintf("%06d", rand.Intn(1000000))
+	resetTokensMu.Lock()
+	resetTokens[username] = code
+	resetTokensMu.Unlock()
+
+	// A real app would email this. This one just prints it on screen -
+	// another intentional information-disclosure shortcut.
+	fmt.Fprintf(w, `<h1>Reset code sent</h1>
+<p>(Demo shortcut: your code is <b>%s</b> - a real app would email this instead.)</p>
+<form action="/reset-password" method="post">
+  <input type="hidden" name="username" value="%s">
+  <input name="code" placeholder="6-digit code">
+  <input name="new_password" type="password" placeholder="New password">
+  <button class="btn">Reset password</button>
+</form>`, code, username)
+	fmt.Fprint(w, pageFooter)
+}
+
+func handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Reset Password"))
+
+	if r.Method != http.MethodPost {
+		fmt.Fprint(w, `<h1>Reset password</h1>
+<form action="/reset-password" method="post">
+  <input name="username" placeholder="Username">
+  <input name="code" placeholder="6-digit code">
+  <input name="new_password" type="password" placeholder="New password">
+  <button class="btn">Reset password</button>
+</form>`)
+		fmt.Fprint(w, pageFooter)
+		return
+	}
+
+	username := r.FormValue("username")
+	code := r.FormValue("code")
+	newPassword := r.FormValue("new_password")
+
+	resetTokensMu.Lock()
+	expected, ok := resetTokens[username]
+	resetTokensMu.Unlock()
+
+	// No rate limiting on this comparison: a fuzzer/intruder can just
+	// try all 1,000,000 codes.
+	if !ok || code != expected {
+		fmt.Fprint(w, "<p>That code is invalid or has expired.</p>")
+		fmt.Fprint(w, pageFooter)
+		return
+	}
+
+	usersMu.Lock()
+	for i := range fakeUsers {
+		if fakeUsers[i].Username == username {
+			fakeUsers[i].Password = newPassword
+		}
+	}
+	usersMu.Unlock()
+	db.Exec("UPDATE users SET password = ? WHERE username = ?", newPassword, username)
+
+	resetTokensMu.Lock()
+	delete(resetTokens, username)
+	resetTokensMu.Unlock()
+
+	fmt.Fprint(w, `<h1>Password updated</h1><p><a href="/login">Sign in</a> with your new password.</p>`)
+	fmt.Fprint(w, pageFooter)
+}
+
+// ---------------------------------------------------------------------
+// Unchecked array index (CWE-129): "related products" indexed straight
+// from a query param with no bounds check. Any index outside [0,3)
+// panics - recovered safely by recoverMiddleware - which is exactly the
+// kind of crash a basic fuzzer finds within seconds of throwing
+// out-of-range integers at an endpoint.
+// ---------------------------------------------------------------------
+
+func handleRelatedProductCrash(w http.ResponseWriter, r *http.Request) {
+	index, _ := strconv.Atoi(r.URL.Query().Get("index"))
+	w.Header().Set("Content-Type", "application/json")
+	p := fakeProducts[index]
+	json.NewEncoder(w).Encode(p)
 }
