@@ -181,7 +181,11 @@ func getenvDefault(key, fallback string) string {
 // "missing entirely".
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.String())
+		if tag := classifyRequest(r); tag != "" {
+			log.Printf("%s %s %s [%s]", r.RemoteAddr, r.Method, r.URL.String(), tag)
+		} else {
+			log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.String())
+		}
 		// Verbose, deliberately outdated server banner disclosure: this is
 		// a Go binary, but it claims to be a long-EOL Apache/PHP stack so
 		// scanners that fingerprint software versions have something to

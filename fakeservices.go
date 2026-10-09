@@ -25,13 +25,22 @@ func startFakeServices() {
 	// Plaintext/line-based protocols: old, vulnerable-sounding version
 	// strings on purpose, matching the rest of the app's "ancient stack"
 	// theme.
-	startBannerService(":21", "220 (vsFTPd 2.3.4)\r\n", nil)
-	startBannerService(":23", "Ubuntu 16.04.6 LTS\r\nacme-web01 login: ", nil)
-	startBannerService(":25", "220 mail.acme-supplies.internal ESMTP Postfix (Ubuntu)\r\n", nil)
+	// SSH sends its identification string immediately on connect, before
+	// any key exchange - a real, old, vulnerable-history OpenSSH version
+	// fingerprints just as easily as any plaintext banner.
+	startBannerService(":22", "SSH-2.0-OpenSSH_7.2p2 Ubuntu-4ubuntu2.8\r\n", nil)
+	startFTPService(":21")
+	startTelnetService(":23")
 	startBannerService(":6379", "", redisReply)
 	startBannerService(":11211", "", memcachedReply)
 	startBannerService(":2181", "", zookeeperReply) // ZooKeeper's "four-letter commands"
 	startMySQLService(":3306")                      // binary greeting, not a plain-text banner
+
+	// Mail stack: stateful SMTP/IMAP/POP3 fakes - see mailservices.go.
+	startMailServices()
+
+	// DNS zone transfer (AXFR) - see dns.go.
+	startDNSAXFRService(":53")
 
 	// Protocols where the client speaks first (PostgreSQL, MSSQL, RDP,
 	// VNC, MongoDB, Oracle, Cassandra, Kafka, RabbitMQ/AMQP, ActiveMQ,
@@ -131,7 +140,136 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 		if err != nil {
 			return
 		}
+		log.Printf("%s connected to %s [T1133 External Remote Services]", conn.RemoteAddr(), ln.Addr())
 		go handle(conn)
+	}
+}
+
+// startFTPService models the actual vulnerability behind an exposed
+// vsFTPd 2.3.4, not just the open port: anonymous login is accepted, and
+// once "in", LIST reveals the same sensitive-looking files as the real
+// backup exposure on /uploads/ - the realistic way this class of bug
+// chains together (FTP misconfig -> file/credential disclosure).
+func startFTPService(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	go acceptLoop(ln, handleFTPConn)
+}
+
+func handleFTPConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	fmt.Fprint(conn, "220 (vsFTPd 2.3.4)\r\n")
+
+	loggedIn := false
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		upper := strings.ToUpper(line)
+		switch {
+		case strings.HasPrefix(upper, "USER"):
+			fmt.Fprint(conn, "331 Please specify the password.\r\n")
+		case strings.HasPrefix(upper, "PASS"):
+			// The actual bug: any username/password (including the
+			// anonymous/anonymous or anonymous/blank convention) is
+			// accepted - there's no real auth check at all.
+			loggedIn = true
+			log.Printf("%s FTP login accepted [T1078.001 Valid Accounts: Default Accounts]", conn.RemoteAddr())
+			fmt.Fprint(conn, "230 Login successful.\r\n")
+		case strings.HasPrefix(upper, "SYST"):
+			fmt.Fprint(conn, "215 UNIX Type: L8\r\n")
+		case strings.HasPrefix(upper, "PWD"):
+			fmt.Fprint(conn, `257 "/" is the current directory`+"\r\n")
+		case strings.HasPrefix(upper, "LIST") || strings.HasPrefix(upper, "NLST"):
+			if !loggedIn {
+				fmt.Fprint(conn, "530 Please login with USER and PASS.\r\n")
+				continue
+			}
+			log.Printf("%s FTP directory listing requested [T1005 Data from Local System]", conn.RemoteAddr())
+			fmt.Fprint(conn, "150 Here comes the directory listing.\r\n")
+			fmt.Fprint(conn, "-rw-r--r--    1 ftp      ftp          4823 Jan 03  2024 backup.sql\r\n")
+			fmt.Fprint(conn, "-rw-r--r--    1 ftp      ftp           512 Jan 03  2024 config.old\r\n")
+			fmt.Fprint(conn, "226 Directory send OK.\r\n")
+		case strings.HasPrefix(upper, "QUIT"):
+			fmt.Fprint(conn, "221 Goodbye.\r\n")
+			return
+		default:
+			fmt.Fprint(conn, "502 Command not implemented.\r\n")
+		}
+	}
+}
+
+// startTelnetService is a light, Cowrie-style interactive honeypot: any
+// credentials are accepted, and every command typed afterward gets
+// logged (tagged as actual command-and-scripting-interpreter activity)
+// and answered with a plausible-looking canned response - enough to
+// "capture" what an attacker tries without ever running anything real.
+func startTelnetService(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("fake service %s not started: %v", addr, err)
+		return
+	}
+	go acceptLoop(ln, handleTelnetConn)
+}
+
+func handleTelnetConn(conn net.Conn) {
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Minute))
+
+	fmt.Fprint(conn, "Ubuntu 16.04.6 LTS\r\nacme-web01 login: ")
+	scanner := bufio.NewScanner(conn)
+	if !scanner.Scan() {
+		return
+	}
+	fmt.Fprint(conn, "Password: ")
+	if !scanner.Scan() {
+		return
+	}
+	log.Printf("%s telnet login accepted with arbitrary credentials [T1078.001 Valid Accounts: Default Accounts]", conn.RemoteAddr())
+
+	fmt.Fprint(conn, "\r\nWelcome to Ubuntu 16.04.6 LTS (GNU/Linux 4.4.0-104-generic x86_64)\r\n\r\n")
+	fmt.Fprint(conn, "acme-web01:~$ ")
+	for scanner.Scan() {
+		cmd := strings.TrimSpace(scanner.Text())
+		if cmd == "" {
+			fmt.Fprint(conn, "acme-web01:~$ ")
+			continue
+		}
+		log.Printf("%s telnet command: %q [T1059 Command and Scripting Interpreter]", conn.RemoteAddr(), cmd)
+		if out := fakeShellOutput(cmd); out != "" {
+			fmt.Fprint(conn, out)
+		}
+		if first, _, _ := strings.Cut(cmd, " "); first == "exit" || first == "logout" {
+			fmt.Fprint(conn, "logout\r\n")
+			return
+		}
+		fmt.Fprint(conn, "acme-web01:~$ ")
+	}
+}
+
+func fakeShellOutput(cmd string) string {
+	first, _, _ := strings.Cut(cmd, " ")
+	switch first {
+	case "whoami":
+		return "www-data\r\n"
+	case "id":
+		return "uid=33(www-data) gid=33(www-data) groups=33(www-data)\r\n"
+	case "uname":
+		return "Linux acme-web01 4.4.0-104-generic x86_64 GNU/Linux\r\n"
+	case "pwd":
+		return "/home/www-data\r\n"
+	case "ls":
+		return "backup.sql  config.old  notes.txt\r\n"
+	case "cat":
+		return "cat: permission denied\r\n"
+	case "exit", "logout":
+		return ""
+	default:
+		return first + ": command not found\r\n"
 	}
 }
 
@@ -140,11 +278,19 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 // (reporting a real, old Redis version) to succeed.
 func redisReply(line string) string {
 	upper := strings.ToUpper(strings.TrimSpace(line))
-	if strings.Contains(upper, "INFO") {
+	switch {
+	case strings.Contains(upper, "CONFIG GET REQUIREPASS"):
+		// An empty value is the actual finding: not just that Redis is
+		// reachable, but that it has no password set at all - the exact
+		// signal behind a long string of real ransom/wiper incidents
+		// against internet-facing Redis instances.
+		return "*2\r\n$11\r\nrequirepass\r\n$0\r\n\r\n"
+	case strings.Contains(upper, "INFO"):
 		info := "# Server\r\nredis_version:2.8.4\r\nos:Linux 4.4.0-x86_64\r\n"
 		return fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+	default:
+		return "+PONG\r\n"
 	}
-	return "+PONG\r\n"
 }
 
 // memcachedReply answers the classic "version" probe; anything else gets
@@ -231,7 +377,11 @@ func startFakeHTTPService(addr string, handler http.HandlerFunc) {
 		log.Printf("fake service %s not started: %v", addr, err)
 		return
 	}
-	srv := &http.Server{Handler: handler}
+	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s %s [T1133 External Remote Services]", r.RemoteAddr, r.Method, r.URL.String())
+		handler(w, r)
+	})
+	srv := &http.Server{Handler: logged}
 	go func() {
 		if err := srv.Serve(ln); err != nil {
 			log.Printf("fake service %s stopped: %v", addr, err)

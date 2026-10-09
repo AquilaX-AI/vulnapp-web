@@ -164,17 +164,26 @@ protocol beyond a first-contact banner or response; see
 
 | Port | Pretends to be | Fidelity |
 |---|---|---|
-| 21 | FTP (vsFTPd 2.3.4) | Real banner on connect |
-| 23 | Telnet | Real banner on connect |
-| 25 | SMTP (Postfix) | Real banner on connect |
+| 22 | SSH (OpenSSH 7.2p2 Ubuntu) | Real identification string, sent the way SSH actually does (before any key exchange) |
+| 21 | FTP (vsFTPd 2.3.4) | **Stateful**: accepts anonymous login (any USER/PASS) and lists real-looking sensitive files via `LIST` |
+| 23 | Telnet | **Stateful**: a light interactive honeypot - accepts any credentials, then answers common recon commands (`whoami`, `id`, `uname`, `ls`, ...) and logs every command typed |
 | 3306 | MySQL 5.5.8 | Real binary protocol greeting packet |
-| 6379 | Redis 2.8.4 | Replies `+PONG` to `PING`, a fake `INFO` block to `INFO` |
+| 6379 | Redis 2.8.4 | `PING` -> `+PONG`, `INFO` -> a fake info block, `CONFIG GET requirepass` -> empty (confirms no password set at all) |
 | 11211 | Memcached 1.4.15 | Replies to the `version` command |
 | 9200 | Elasticsearch 1.4.2 | Full fake HTTP root response (real unauth-RCE-history version) |
 | 2375 | Docker Engine API (no TLS) | Full fake HTTP `/version` response |
 | 5984 | CouchDB 1.6.1 | Full fake HTTP root response |
 | 8500 | Consul 0.7.0 | Full fake HTTP agent-self response |
 | 5432, 1433, 3389, 5900, 27017 | PostgreSQL, MSSQL, RDP, VNC, MongoDB | Port accepts the connection and stays silent - protocol-accurate, since real clients speak first on all five |
+
+The mail stack an MX record would actually point at ([`mailservices.go`](mailservices.go)), plus a DNS nameserver that allows zone transfers ([`dns.go`](dns.go)) - these are **stateful, multi-step protocol simulations**, not single banners, modeling the specific real misconfiguration behind each one:
+
+| Port | Pretends to be | The actual finding |
+|---|---|---|
+| 25, 587, 465 | SMTP (Postfix) - MTA, submission, "SMTPS" | **Open relay**: `RCPT TO` is accepted for any domain, not just ones this server should handle. **User enumeration**: `VRFY <user>` confirms whether a local account exists. |
+| 143, 993 | IMAP (Dovecot on 993) | `CAPABILITY` advertises `AUTH=PLAIN`/`AUTH=LOGIN` with no `STARTTLS` and no `LOGINDISABLED` - plaintext credentials over an unencrypted connection are accepted |
+| 110, 995 | POP3 | Same plaintext-auth story, in `USER`/`PASS` form |
+| 53 (TCP) | A nameserver | Allows unauthenticated **zone transfer (AXFR)** for any zone name asked - responds with a full fake internal zone (SOA/NS/MX/A records) reusing the same fake IPs `/api/config` and the kubelet/Consul/Eureka fakes already leak. Verified with a real `dig axfr <zone> @host` |
 
 Plus a batch of ops/dev tooling - the single most common way this class
 of service actually ends up reachable: someone spins it up for a quick
@@ -212,6 +221,40 @@ binary-protocol databases/brokers:
 | 10250 | kubelet API | Fake `/pods` PodList - the real historical no-authn/authz misconfiguration |
 | 5985 | WinRM | Real 401 + `Negotiate` challenge - still fingerprints a reachable remote-management endpoint |
 | 1521, 9042, 9092, 5672, 61616, 445 | Oracle, Cassandra, Kafka, RabbitMQ (AMQP), ActiveMQ (OpenWire), SMB | Port accepts the connection and stays silent - protocol-accurate, clients speak first on all six |
+
+## MITRE ATT&CK tagging in the logs
+
+Every contact with this app - a web request or a connection to any fake
+service above - gets logged with the client IP and, where the request
+matches a known signature, a best-fit [MITRE ATT&CK](https://attack.mitre.org/)
+technique, the same way a WAF/SIEM rule set tags traffic:
+
+```
+2026/01/15 09:12:03 203.0.113.7 POST /login [T1190 Exploit Public-Facing Application (SQL injection)]
+2026/01/15 09:12:05 203.0.113.7 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files]
+2026/01/15 09:12:08 203.0.113.7 connected to [::]:3306 [T1133 External Remote Services]
+```
+
+[`mitre.go`](mitre.go) holds the classifier: it inspects the path, query
+string, form body (read and restored, so the real handler still sees it
+normally), and `User-Agent` against a prioritized set of regex
+signatures - SQL injection, XSS, path traversal, command/template
+injection, credential/cloud-metadata file hits, mass-assignment writes,
+brute-force attempts against `/login`/`/reset-password`, and known
+scanner User-Agents - and returns the first match. The fake TCP/HTTP
+services tag every connection as `T1133 External Remote Services`
+uniformly, plus a couple of more specific tags for particular commands
+(SMTP `VRFY` -> `T1087 Account Discovery`, FTP/Telnet login -> `T1078.001
+Valid Accounts: Default Accounts`, IMAP/POP3 plaintext auth -> `T1040
+Network Sniffing`, DNS `AXFR` -> `T1018 Remote System Discovery`).
+
+This is advisory classification from a single request in isolation, the
+same limitation any signature-based detector has - it's meant to make
+the logs legible at a glance, not to be a certified detector. A gap
+worth knowing about if you're comparing it against a real EDR/SIEM rule
+set: it has no equivalent for the race conditions or the ReDoS in
+[`pentest.go`](pentest.go), since spotting those needs request *timing/
+sequencing*, not a pattern in a single request's content.
 
 ## What different kinds of scanners will find
 
@@ -266,7 +309,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **71 findings across 18 rule IDs**, including:
+reports **80 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|
