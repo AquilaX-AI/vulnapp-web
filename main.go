@@ -28,6 +28,9 @@ import (
 	"runtime/debug"
 )
 
+// version is overridden at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := initStore(); err != nil {
 		log.Fatalf("failed to initialize store: %v", err)
@@ -74,6 +77,8 @@ func main() {
 	mux.HandleFunc("/crash", handleCrashStackTrace)
 
 	handler := recoverMiddleware(logMiddleware(mux))
+
+	fmt.Printf("vulnapp-web %s\n", version)
 
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")
 	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")

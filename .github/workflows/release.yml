@@ -1,0 +1,53 @@
+name: Release
+
+# Builds a single statically-linked binary per platform. All web assets
+# (.env, static files, upload decoys) and the self-signed TLS cert
+# generator are already embedded/built in, so each binary is a "fat"
+# executable: download it, chmod +x, and run it directly on a server -
+# no other files, no reverse proxy, no runtime dependencies needed.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+
+          build() {
+            local goos="$1" goarch="$2" ext="$3"
+            local out="dist/vulnapp-web-${VERSION}-${goos}-${goarch}${ext}"
+            echo "building ${out}"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "$out" .
+          }
+
+          build linux   amd64 ""
+          build linux   arm64 ""
+          build darwin  amd64 ""
+          build darwin  arm64 ""
+          build windows amd64 ".exe"
+
+          cd dist && sha256sum * > checksums.txt && cd -
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
