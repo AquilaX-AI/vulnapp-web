@@ -118,6 +118,13 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
     <p>Give $10, get $10.</p>
     <a class="btn" href="/transfer?to=friend@example.com&amp;amount=10">Send referral credit</a>
   </div>
+  <div class="card">
+    <h2>Have a promo code?</h2>
+    <form action="/api/validate-coupon" method="get" class="form-inline">
+      <input name="code" placeholder="e.g. SAVE10">
+      <button class="btn">Check format</button>
+    </form>
+  </div>
 </section>
 
 <section class="section">
@@ -259,6 +266,16 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "role", Value: role})
 		http.SetCookie(w, &http.Cookie{Name: "username", Value: uname})
 
+		// Session fixation: whatever session_id was already attached to
+		// this request (see sessionFixationMiddleware) - including one an
+		// attacker set via a crafted link before the victim ever logged
+		// in - becomes the authenticated session. It's never rotated.
+		if sid, _ := r.Context().Value(sessionIDKey).(string); sid != "" {
+			sessionsMu.Lock()
+			sessions[sid] = uname
+			sessionsMu.Unlock()
+		}
+
 		if r.FormValue("remember") != "" {
 			// "Remember me" token: signed with the same weak, hardcoded
 			// secret that /api/config leaks as "jwt_secret", via a
@@ -337,7 +354,7 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	fmt.Fprint(w, `<section class="section"><h1>Product details</h1><table><tr><th>ID</th><th>Name</th><th>Price</th></tr>`)
-	var firstName string
+	var firstID, firstName, firstPrice string
 	for rows.Next() {
 		var colID sql.NullString
 		var name sql.NullString
@@ -347,7 +364,7 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if firstName == "" {
-			firstName = name.String
+			firstID, firstName, firstPrice = colID.String, name.String, price.String
 		}
 		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", colID.String, name.String, price.String)
 	}
@@ -356,6 +373,17 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 	if firstName != "" {
 		slug := strings.ToLower(strings.ReplaceAll(firstName, " ", "-"))
 		fmt.Fprintf(w, `<p><a href="/files?name=%s-spec.txt">Download spec sheet</a></p>`, slug)
+
+		// Business logic flaw: price travels as a plain, client-editable
+		// form field instead of being re-looked-up server-side at
+		// checkout.
+		fmt.Fprintf(w, `<form action="/checkout" method="get" class="form-inline">
+  <input type="hidden" name="product_id" value="%s">
+  <input type="hidden" name="price" value="%s">
+  <input name="quantity" value="1" size="3">
+  <input name="promo" placeholder="Promo code (optional)">
+  <button class="btn">Buy now</button>
+</form>`, firstID, firstPrice)
 	}
 	fmt.Fprint(w, "</section>")
 	fmt.Fprint(w, pageFooter)
@@ -427,6 +455,8 @@ func handleAccountPage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, pageHeader("My Account"))
 	fmt.Fprintf(w, `<h1>My account</h1>
 <div id="account">Loading your details&hellip;</div>
+<p><a href="/api/export?api_key=%s&amp;id=%s">Export my data (CSV)</a></p>
+<div id="live-updates"></div>
 <script>
 fetch('/profile?id=%s')
   .then(function(r){ return r.json(); })
@@ -445,7 +475,15 @@ fetch('/api/me')
         '<p><small>Remembered sign-in: ' + d.username + ' (' + d.role + ')</small></p>';
     }
   });
-</script>`, id)
+
+// Live order updates over a WebSocket - see /ws in pentest.go.
+var wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+var ws = new WebSocket(wsProto + location.host + '/ws');
+ws.onmessage = function(evt) {
+  var msg = JSON.parse(evt.data);
+  document.getElementById('live-updates').innerText = msg.message;
+};
+</script>`, exportAPIKey, id, id)
 	fmt.Fprint(w, pageFooter)
 }
 
@@ -937,6 +975,13 @@ func handleResetPassword(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, pageFooter)
 		return
 	}
+
+	// Race condition (CWE-367): the code is checked here but not deleted
+	// until after this delay (standing in for a real DB write), so two
+	// concurrent requests using the same still-valid code both pass the
+	// check above before either one consumes it - a one-time code usable
+	// more than once.
+	time.Sleep(50 * time.Millisecond)
 
 	usersMu.Lock()
 	for i := range fakeUsers {

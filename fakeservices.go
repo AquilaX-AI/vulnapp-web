@@ -30,13 +30,18 @@ func startFakeServices() {
 	startBannerService(":25", "220 mail.acme-supplies.internal ESMTP Postfix (Ubuntu)\r\n", nil)
 	startBannerService(":6379", "", redisReply)
 	startBannerService(":11211", "", memcachedReply)
-	startMySQLService(":3306") // binary greeting, not a plain-text banner
+	startBannerService(":2181", "", zookeeperReply) // ZooKeeper's "four-letter commands"
+	startMySQLService(":3306")                      // binary greeting, not a plain-text banner
 
 	// Protocols where the client speaks first (PostgreSQL, MSSQL, RDP,
-	// VNC, MongoDB): accepting the connection and staying silent is
-	// actually protocol-accurate, and still enough for a port scanner to
-	// mark the port "open".
-	for _, addr := range []string{":5432", ":1433", ":3389", ":5900", ":27017"} {
+	// VNC, MongoDB, Oracle, Cassandra, Kafka, RabbitMQ/AMQP, ActiveMQ,
+	// SMB): accepting the connection and staying silent is actually
+	// protocol-accurate, and still enough for a port scanner to mark the
+	// port "open".
+	for _, addr := range []string{
+		":5432", ":1433", ":3389", ":5900", ":27017",
+		":1521", ":9042", ":9092", ":5672", ":61616", ":445",
+	} {
 		startSilentService(addr)
 	}
 
@@ -64,6 +69,19 @@ func startFakeServices() {
 	startFakeHTTPService(":8080", handleFakeJenkins)
 	startFakeHTTPService(":9000", handleFakePortainer)
 	startFakeHTTPService(":19999", handleFakeNetdata)
+
+	// Infrastructure/orchestration APIs - the category behind some of
+	// the bigger real-world breaches (exposed etcd/kubelet leaking
+	// cluster secrets, open Docker registries leaking proprietary
+	// images, ...).
+	startFakeHTTPService(":5000", handleFakeDockerRegistry)
+	startFakeHTTPService(":8161", handleFakeActiveMQ)
+	startFakeHTTPService(":8081", handleFakeNexus)
+	startFakeHTTPService(":50070", handleFakeHadoopNameNode)
+	startFakeHTTPService(":2379", handleFakeEtcd)
+	startFakeHTTPService(":6443", handleFakeKubernetesAPI)
+	startFakeHTTPService(":10250", handleFakeKubelet)
+	startFakeHTTPService(":5985", handleFakeWinRM)
 }
 
 func startBannerService(addr, banner string, reply func(string) string) {
@@ -136,6 +154,25 @@ func memcachedReply(line string) string {
 		return "VERSION 1.4.15\r\n"
 	}
 	return "ERROR\r\n"
+}
+
+// zookeeperReply answers ZooKeeper's real "four-letter commands" -
+// "ruok" (are you ok) and "stat", both genuinely meant to need no auth,
+// but a real source of information disclosure (and historically, DDoS
+// amplification via "stat"/"wchp"/"wchc") when reachable from anywhere
+// but localhost - which is the actual, common misconfiguration.
+func zookeeperReply(line string) string {
+	cmd := strings.ToLower(strings.TrimSpace(line))
+	switch cmd {
+	case "ruok":
+		return "imok"
+	case "stat":
+		return "Zookeeper version: 3.4.6-1569965, built on 02/20/2014 09:09 GMT\n" +
+			"Clients:\n /127.0.0.1:52145[0](queued=0,recved=1,sent=0)\n" +
+			"Latency min/avg/max: 0/0/0\nReceived: 1\nSent: 0\nOutstanding: 0\nNode count: 4\n"
+	default:
+		return ""
+	}
 }
 
 // startMySQLService sends the real MySQL wire protocol's initial
@@ -399,4 +436,88 @@ func handleFakeNetdata(w http.ResponseWriter, r *http.Request) {
   "cores_total": 4,
   "ram_total": 8589934592
 }`)
+}
+
+// ---------------------------------------------------------------------
+// Infrastructure/orchestration APIs - behind some of the bigger
+// real-world breaches when left reachable: exposed etcd/kubelet leaking
+// cluster secrets and workload details, open Docker registries leaking
+// proprietary images, forgotten build-artifact repos.
+// ---------------------------------------------------------------------
+
+// handleFakeDockerRegistry mimics the Docker Registry v2 API's root
+// check (`{}` + a specific header) - the real signal a scanner looks for
+// to confirm "this is a registry", before trying to list/pull images
+// from it with no credentials at all.
+func handleFakeDockerRegistry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{}`)
+}
+
+// handleFakeActiveMQ names a specific, real, unauthenticated-RCE CVE
+// (2016-3088, via the admin console's FileServer PUT handler).
+func handleFakeActiveMQ(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Apache ActiveMQ</title></head>
+<body><h1>Apache ActiveMQ 5.13.0</h1><p><a href="/admin">Manage ActiveMQ broker</a></p></body></html>`)
+}
+
+func handleFakeNexus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>Sonatype Nexus Repository Manager</title></head>
+<body>Nexus Repository Manager 3.14.0-04 (anonymous access enabled)</body></html>`)
+}
+
+// handleFakeHadoopNameNode mimics an exposed, pre-Kerberos-by-default
+// NameNode UI - a real and common way an entire HDFS cluster's file
+// listing ends up reachable with no auth.
+func handleFakeHadoopNameNode(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head><title>NameNode information</title></head>
+<body><h1>acme-hadoop01</h1><p>Hadoop 2.6.0</p><p>Cluster ID: CID-acme-0001</p></body></html>`)
+}
+
+// handleFakeEtcd mimics etcd's real, genuinely-unauthenticated-by-default
+// /version endpoint. The actual finding is everything *past* this -
+// etcd's data API with no auth leaks every secret a cluster stored in
+// it - which is exactly why this one gets the "real incident" framing in
+// the README instead of being left to a generic DB entry.
+func handleFakeEtcd(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"etcdserver":"3.1.10","etcdcluster":"3.1.0"}`)
+}
+
+// handleFakeKubernetesAPI reproduces the real response an unauthenticated
+// request gets from an API server with anonymous auth enabled: a 403,
+// but one that still confirms "this is a Kubernetes API server" and
+// exactly which user/role the request was evaluated as.
+func handleFakeKubernetesAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	fmt.Fprint(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"forbidden: User \"system:anonymous\" cannot get path \"/\"","reason":"Forbidden","details":{},"code":403}`)
+}
+
+// handleFakeKubelet models the real historical misconfiguration (no
+// authn/authz on the kubelet API) that let anyone list every pod - IPs,
+// images, container names - running on the node with no credentials.
+func handleFakeKubelet(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{
+  "kind": "PodList",
+  "items": [
+    {"metadata": {"name": "orders-api-6f9d8", "namespace": "acme-prod"}, "status": {"hostIP": "10.0.4.23", "podIP": "10.244.1.7"}},
+    {"metadata": {"name": "auth-svc-7c2b1", "namespace": "acme-prod"}, "status": {"hostIP": "10.0.4.23", "podIP": "10.244.1.9"}}
+  ]
+}`)
+}
+
+// handleFakeWinRM reproduces the real 401 challenge an unauthenticated
+// WinRM request gets - still a useful fingerprint on its own (a
+// confirmed remote-management endpoint reachable from wherever the scan
+// is running from, a common lateral-movement target).
+func handleFakeWinRM(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", "Negotiate")
+	w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
+	w.WriteHeader(http.StatusUnauthorized)
 }

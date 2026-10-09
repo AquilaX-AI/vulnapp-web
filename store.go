@@ -81,6 +81,12 @@ func initStore() error {
 	if err != nil {
 		return err
 	}
+	// database/sql pools multiple underlying connections, and each one
+	// gets its own independent, empty ":memory:" database - SQLite
+	// doesn't share in-memory data across connections by default. Without
+	// this, any concurrent load that forces the pool to open a second
+	// connection sees a database with no tables at all.
+	db.SetMaxOpenConns(1)
 
 	schema := `
 	CREATE TABLE users (

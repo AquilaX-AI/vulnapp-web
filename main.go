@@ -109,7 +109,20 @@ func main() {
 	mux.HandleFunc("/internal/metadata", handleInternalMetadata)
 	mux.HandleFunc("/crash", handleCrashStackTrace)
 
-	handler := recoverMiddleware(logMiddleware(methodProbeMiddleware(mux)))
+	// Race condition, ReDoS, CSWSH, session fixation, business logic,
+	// token-in-URL, multi-cloud SSRF targets, and blind SSRF - see
+	// pentest.go.
+	mux.HandleFunc("/api/withdraw", handleWithdrawRace)
+	mux.HandleFunc("/api/validate-coupon", handleValidateCoupon)
+	mux.HandleFunc("/ws", handleWebSocket)
+	mux.HandleFunc("/api/session", handleAPISession)
+	mux.HandleFunc("/checkout", handleCheckout)
+	mux.HandleFunc("/api/export", handleExportAPI)
+	mux.HandleFunc("/computeMetadata/v1/instance/service-accounts/default/token", handleGCPMetadata)
+	mux.HandleFunc("/metadata/instance", handleAzureMetadata)
+	mux.HandleFunc("/api/webhook-test", handleWebhookTest)
+
+	handler := recoverMiddleware(logMiddleware(sessionFixationMiddleware(methodProbeMiddleware(mux))))
 
 	fmt.Printf("vulnapp-web %s\n", version)
 

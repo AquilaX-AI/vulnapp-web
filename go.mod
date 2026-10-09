@@ -4,6 +4,8 @@ go 1.26.0
 
 require (
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
+	github.com/dlclark/regexp2 v1.12.0
+	github.com/gorilla/websocket v1.5.3
 	modernc.org/sqlite v1.60.1
 )
 

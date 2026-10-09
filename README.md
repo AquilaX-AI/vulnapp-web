@@ -139,9 +139,19 @@ sudo ./vulnapp-web-vX.Y.Z-linux-amd64
 | Cacheable sensitive responses | `/profile`, `/api/config` | `Cache-Control: public, max-age=3600` on responses containing PII/secrets |
 | Host header injection | `/forgot-password` | The "reset link" is built from the request's own `Host` header with no allowlist |
 | Git reflog exposure | `/.git/logs/HEAD` | A commit message that confesses to a leaked (fake) credential |
+| Race condition / TOCTOU (CWE-367) | `GET /api/withdraw?amount=` | Balance is checked, then deducted 50ms later with no lock held across the gap - concurrent requests all pass the check before any of them deducts, driving the balance negative |
+| Race condition / one-time code reuse (CWE-367) | `/reset-password` | Same gap between validating a reset code and deleting it - concurrent requests with the same code can all succeed |
+| ReDoS (CWE-1333) | `GET /api/validate-coupon?code=` | A backtracking regex (via `regexp2`, since Go's stdlib `regexp` is immune by design) with no match timeout - exponential time growth confirmed (9ms -> 90ms -> 2.6s -> 21s for 10/20/25/28 repeated characters) |
+| Cross-Site WebSocket Hijacking | `/ws` (used by `/account`) | `CheckOrigin` hardcoded to accept any origin - confirmed a cross-origin upgrade with the victim's cookies attached completes (`101 Switching Protocols`) |
+| Session fixation (CWE-384) | global (`session_id`), `/login` | A client-supplied `session_id` - even via a URL query param - is adopted instead of only trusting a server-issued one, and it's never rotated on login |
+| Business logic / price tampering (CWE-840) | `/checkout` (linked from product pages) | Price is a plain, client-editable form field, never re-checked against the real catalog price; any non-empty promo code zeroes the total |
+| Secret passed via URL (CWE-598) | `/api/export?api_key=` (linked from `/account`) | A real-looking API key travels in the URL instead of a header, so it lands in this app's own access logs, browser history, and would leak via Referer |
+| Multi-cloud SSRF targets | `/computeMetadata/v1/...` (GCP), `/metadata/instance` (Azure) | Mirror the real header-based anti-SSRF checks those providers actually ship - reachable directly, but (correctly) *not* chainable through this app's own `/fetch`, which can't inject the required header |
+| Blind SSRF | `/api/webhook-test?url=` | Fetches server-side but never echoes the response - confirming it fired requires an out-of-band listener (Collaborator/webhook.site-style), unlike the "visible" SSRF on `/fetch` |
 
-See [`handlers.go`](handlers.go) for the implementation of each, and
-[`decoy.go`](decoy.go) for the fake path-traversal fingerprints.
+See [`handlers.go`](handlers.go) and [`pentest.go`](pentest.go) for the
+implementation of each, and [`decoy.go`](decoy.go) for the fake
+path-traversal fingerprints.
 
 ## Exposed internal services
 
@@ -184,6 +194,24 @@ look and forgets it's there.
 | 8080 | Jenkins (anonymous access) | Fake dashboard + a `/script` Groovy console page - the classic exposed-Jenkins RCE vector |
 | 9000 | Portainer | `Authentication:false` in the fake API response - the real smoking gun for an unsecured instance |
 | 19999 | Netdata | Fake `/api/v1/info` leaking hostname/OS/kernel/hardware - matches the real default (no auth) |
+
+Plus infrastructure/orchestration APIs (behind some of the bigger
+real-world breaches: exposed etcd/kubelet leaking cluster secrets, open
+registries leaking proprietary images) and a last round of
+binary-protocol databases/brokers:
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 2181 | ZooKeeper | Real "four-letter commands": `ruok` -> `imok`, `stat` -> a real-shaped stat block |
+| 5000 | Docker Registry v2 | Real root-check response (`{}` + the `Docker-Distribution-Api-Version` header) |
+| 8161 | ActiveMQ 5.13.0 admin console | Names a real unauthenticated-RCE CVE (2016-3088) |
+| 8081 | Sonatype Nexus 3.14.0 | "Anonymous access enabled" banner |
+| 50070 | Hadoop NameNode | Fake cluster-info page |
+| 2379 | etcd | Real, genuinely-unauthenticated-by-default `/version` response |
+| 6443 | Kubernetes API server | The real 403 an anonymous request gets - confirms the server without needing more |
+| 10250 | kubelet API | Fake `/pods` PodList - the real historical no-authn/authz misconfiguration |
+| 5985 | WinRM | Real 401 + `Negotiate` challenge - still fingerprints a reachable remote-management endpoint |
+| 1521, 9042, 9092, 5672, 61616, 445 | Oracle, Cassandra, Kafka, RabbitMQ (AMQP), ActiveMQ (OpenWire), SMB | Port accepts the connection and stays silent - protocol-accurate, clients speak first on all six |
 
 ## What different kinds of scanners will find
 
@@ -238,26 +266,30 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **62 findings across 18 rule IDs**, including:
+reports **71 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|
 | G701 (CWE-89) | SQL injection | `handleLoginSQLi`, `handleProductsSQLi` (`fmt.Sprintf` straight into a query) |
-| G705 (CWE-79) | XSS sink | every unescaped `fmt.Fprintf` into an HTML response (16 hits) |
+| G705 (CWE-79) | XSS sink | every unescaped `fmt.Fprintf` into an HTML response (19 hits) |
 | G708 (CWE-94) | Server-side template injection | `handleRenderSSTI` |
-| G704 (CWE-918) | SSRF | `handleFetchSSRF` |
+| G704 (CWE-918) | SSRF | `handleFetchSSRF`, `handleWebhookTest` |
 | G710 | Open redirect | `handleOpenRedirect` |
 | G402 (CWE-295) | TLS MinVersion too low | `tls.go` (both `tls.Config` literals) |
 | G404 (CWE-338) | Weak RNG (`math/rand`, not `crypto/rand`) | `handleForgotPassword`'s reset code |
 | G501/G401 (CWE-327/328) | Weak crypto primitive (MD5) | `gravatarHash` |
-| G101 (CWE-798) | Hardcoded credentials | `store.go`, `decoy.go`, `/api/config`, `/internal/metadata` literals |
-| G124 (CWE-614) | Cookie missing `Secure`/`HttpOnly` | the `role`/`username`/`remember_token` cookies |
+| G101 (CWE-798) | Hardcoded credentials | `store.go`, `decoy.go`, `pentest.go`'s `exportAPIKey`, `/api/config`, `/internal/metadata` literals |
+| G124 (CWE-614) | Cookie missing `Secure`/`HttpOnly` | the `role`/`username`/`remember_token`/`session_id` cookies |
 | G706 (CWE-117) | Log injection | `logMiddleware`'s unsanitized `log.Printf` of the request path/IP |
 | G112/G114 (CWE-400/676) | No read/header timeout on `http.Server` (Slowloris-class) | `main.go`'s and `fakeservices.go`'s HTTP listeners |
 | G117 (CWE-499) | Secret-shaped field marshaled into a JSON response | `handleProfileUpdateMassAssignment` echoes `User.Password` back |
 | G120 (CWE-400) | Unbounded multipart form parsing | `handleUpload` |
 | G115 (CWE-190) | Int->byte conversion that could overflow | `mysqlGreetingPacket`'s length prefix |
-| G104 (CWE-703) | Unchecked errors | scattered throughout (20 hits) |
+| G104 (CWE-703) | Unchecked errors | scattered throughout (23 hits) |
+
+gosec doesn't have a rule for the ReDoS or race conditions in `pentest.go`
+(those need a dedicated taint/timing analysis, not pattern matching) -
+worth knowing as a gap when comparing SAST tools, not a gosec bug.
 
 Run it yourself: `gosec ./...`.
 
@@ -285,15 +317,26 @@ Run it yourself: `gosec ./...`.
 - **Self-contained binary.** Static assets, upload decoys, and the fake
   `.env` are embedded via `go:embed` ([`assets.go`](assets.go)); there's an
   in-memory SQLite database ([`store.go`](store.go)) seeded with fake data.
-  Nothing is read from disk at runtime.
+  Nothing is read from disk at runtime. The DB connection is pinned to a
+  single pooled connection (`db.SetMaxOpenConns(1)`) - without it, any
+  concurrent load forces `database/sql` to open a second connection, and
+  SQLite doesn't share an in-memory database across connections, so that
+  second one would see an empty schema. This was a real, unintentional
+  bug (not a planted finding) that the race-condition features in
+  [`pentest.go`](pentest.go) exposed during testing, since they were the
+  first thing to actually hit the DB concurrently.
 - **Nothing here can meaningfully harm the host.** Command injection and
   path traversal are faked (no real shell exec, no real filesystem
-  access); the one feature that makes a real network call (SSRF via
-  `/fetch`) is timeout- and size-bounded; every panic (`/crash`,
-  `/api/related`) is recovered; file uploads are held in memory only and
-  capped at 5MB; every fake service in `fakeservices.go` only ever reads
-  from or writes a fixed banner/response to the socket - none of them
-  parse, store, or act on what a client sends.
+  access); every feature that makes a real network call (SSRF via
+  `/fetch` and `/api/webhook-test`) is timeout- and size-bounded; every
+  panic (`/crash`, `/api/related`) is recovered; file uploads are held in
+  memory only and capped at 5MB; every fake service in
+  `fakeservices.go` only ever reads from or writes a fixed banner/
+  response to the socket - none of them parse, store, or act on what a
+  client sends. The ReDoS on `/api/validate-coupon` is real CPU cost, but
+  it's scoped to the one goroutine handling that request - confirmed the
+  rest of the app stays fully responsive while a 20+ second match runs -
+  and input is capped at 1000 characters.
 - **TLS.** No cert/key files needed: the HTTPS listener mints a self-signed
   certificate in memory for whatever hostname a client asks for via SNI,
   caching it per hostname ([`tls.go`](tls.go)). Browsers and scanners will
