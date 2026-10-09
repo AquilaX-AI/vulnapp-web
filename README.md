@@ -58,8 +58,17 @@ HTTP_ADDR=:8080 HTTPS_ADDR=:8443 go run .
 |------------------|---------|-----------------------------------------------------|
 | `HTTP_ADDR`      | `:80`   | Plain HTTP listener address                         |
 | `HTTPS_ADDR`     | `:443`  | HTTPS listener address                              |
+| `TLS_HOSTNAME`   | `velocity-labs.dev` | CN/SAN baked into the self-signed cert |
 | `TLS_CERT_FILE`  | *(none)* | Path to a real certificate (skips self-signed gen) |
 | `TLS_KEY_FILE`   | *(none)* | Path to the matching private key                    |
+
+The HTTPS cert is self-signed, so visitors will get the normal
+untrusted-certificate warning from their browser/client regardless of
+`TLS_HOSTNAME` - that's expected, not a bug. They can still reach the site
+by explicitly accepting the risk (e.g. "Advanced -> Proceed" in a browser,
+or `curl -k`). Setting `TLS_HOSTNAME` just makes the CN/SAN match whatever
+domain you're fronting it with, so that's the *only* warning shown
+instead of an extra hostname-mismatch one on top.
 
 ## Downloading a release
 

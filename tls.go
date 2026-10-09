@@ -28,6 +28,16 @@ func loadOrGenerateCert() (tls.Certificate, error) {
 	return generateSelfSignedCert()
 }
 
+// defaultTLSHostname is the name the self-signed cert is issued for.
+// Override with TLS_HOSTNAME if you're serving this under a different
+// domain. The cert is still self-signed (not issued by a trusted CA), so
+// browsers/clients will show the usual untrusted-certificate warning;
+// matching the hostname just means that's the *only* warning - no extra
+// "hostname mismatch" error on top of it. Visitors can still reach the
+// site by explicitly accepting the risk (e.g. "Advanced -> Proceed" in a
+// browser, or curl -k / --insecure on the command line).
+const defaultTLSHostname = "velocity-labs.dev"
+
 func generateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -39,10 +49,12 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 
+	hostname := getenvDefault("TLS_HOSTNAME", defaultTLSHostname)
+
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   "vulnapp-web",
+			CommonName:   hostname,
 			Organization: []string{"Acme Supplies (vulnapp-web demo)"},
 		},
 		NotBefore:             time.Now().Add(-time.Hour),
@@ -51,7 +63,7 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{"localhost", "vulnapp-web.local"},
+		DNSNames:              []string{hostname, "*." + hostname, "localhost"},
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 
