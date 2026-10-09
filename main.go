@@ -10,10 +10,16 @@
 //
 //	go run .
 //
-// and point your scanner at http://localhost:8080/.
+// By default it listens for plain HTTP on :80 and HTTPS (self-signed
+// certificate, generated at startup) on :443, so it can sit directly on a
+// VM with no reverse proxy in front of it. Override with the HTTP_ADDR /
+// HTTPS_ADDR env vars (e.g. HTTP_ADDR=:8080 HTTPS_ADDR=:8443 for a
+// non-root dev run). Binding :80/:443 on Linux requires root or
+// CAP_NET_BIND_SERVICE - see the README.
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io/fs"
 	"log"
@@ -55,6 +61,7 @@ func main() {
 	mux.HandleFunc("/products", handleProductsSQLi)
 	mux.HandleFunc("/files", handleFilesTraversal)
 	mux.HandleFunc("/redirect", handleOpenRedirect)
+	mux.HandleFunc("/account", handleAccountPage)
 	mux.HandleFunc("/profile", handleProfileIDOR)
 	mux.HandleFunc("/admin", handleAdminBrokenAccess)
 	mux.HandleFunc("/api/config", handleAPIConfigExposure)
@@ -66,15 +73,41 @@ func main() {
 	mux.HandleFunc("/internal/metadata", handleInternalMetadata)
 	mux.HandleFunc("/crash", handleCrashStackTrace)
 
-	addr := os.Getenv("LISTEN_ADDR")
-	if addr == "" {
-		addr = ":8080"
-	}
-
 	handler := recoverMiddleware(logMiddleware(mux))
 
-	fmt.Printf("vulnapp-web listening on %s (intentionally vulnerable - do not expose publicly)\n", addr)
-	log.Fatal(http.ListenAndServe(addr, handler))
+	httpAddr := getenvDefault("HTTP_ADDR", ":80")
+	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")
+
+	cert, err := loadOrGenerateCert()
+	if err != nil {
+		log.Fatalf("failed to prepare TLS certificate: %v", err)
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		fmt.Printf("vulnapp-web listening on http://%s (plain, intentionally vulnerable - do not expose publicly)\n", httpAddr)
+		errCh <- http.ListenAndServe(httpAddr, handler)
+	}()
+
+	go func() {
+		srv := &http.Server{
+			Addr:      httpsAddr,
+			Handler:   handler,
+			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		}
+		fmt.Printf("vulnapp-web listening on https://%s (self-signed certificate, intentionally vulnerable - do not expose publicly)\n", httpsAddr)
+		errCh <- srv.ListenAndServeTLS("", "")
+	}()
+
+	log.Fatal(<-errCh)
+}
+
+func getenvDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // logMiddleware logs each request. It intentionally does not set any

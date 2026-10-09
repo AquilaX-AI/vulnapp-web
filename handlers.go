@@ -14,84 +14,110 @@ import (
 )
 
 // ---------------------------------------------------------------------
+// Shared layout. The site is themed as an ordinary small-business page
+// ("Acme Supplies") on purpose: the vulnerabilities live behind normal
+// looking features (search, catalog, account page, referral program,
+// staff portal, ...) rather than a page that announces what's broken.
+// ---------------------------------------------------------------------
+
+func pageHeader(title string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>%s - Acme Supplies</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- maintenance: temporary admin login left enabled for the launch team, admin / SuperSecretPass!2024 - remove before go-live -->
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="/">&#128230; Acme Supplies</a>
+    <nav>
+      <a href="/products">Products</a>
+      <a href="/search">Search</a>
+      <a href="/comments">Reviews</a>
+      <a href="/account?id=1">My Account</a>
+      <a class="btn-ghost" href="/login">Sign in</a>
+    </nav>
+  </div>
+</header>
+<main class="wrap">
+`, title)
+}
+
+const pageFooter = `
+</main>
+<footer class="site-footer">
+  <div class="wrap">
+    <a href="/redirect?url=https://partners.example.com/distributors">Partner network</a>
+    <span class="dot">&middot;</span>
+    <a href="/ping">Network status</a>
+    <span class="dot">&middot;</span>
+    <a href="/admin">Staff portal</a>
+    <p>&copy; 2026 Acme Supplies Co.</p>
+  </div>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>`
+
+// ---------------------------------------------------------------------
 // Home page
 // ---------------------------------------------------------------------
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Hardcoded credentials leaked via an HTML comment: a classic
-	// "sensitive information in source" finding.
-	fmt.Fprint(w, `<!DOCTYPE html>
-<html>
-<head>
-  <title>vulnapp-web</title>
-  <link rel="stylesheet" href="/static/style.css">
-  <!-- TODO: remove before prod. Backdoor admin login: admin / SuperSecretPass!2024 -->
-</head>
-<body>
-  <h1>vulnapp-web</h1>
-  <p>Intentionally vulnerable demo app for DAST scanner testing. See the README for the full findings catalog.</p>
+	fmt.Fprint(w, pageHeader("Home"))
 
-  <h2>Reflected XSS</h2>
-  <form action="/search" method="get">
-    <input name="q" value="test"><button>Search</button>
-  </form>
+	fmt.Fprint(w, `<section class="hero">
+  <h1>Wholesale office &amp; warehouse supplies, delivered fast</h1>
+  <p>Acme Supplies has been equipping small businesses since 1998. Browse our catalog, read reviews, or sign in to manage your account.</p>
+</section>
 
-  <h2>Stored XSS / guestbook</h2>
-  <form action="/comments" method="post">
-    <input name="author" value="guest">
-    <input name="body" value="hello">
-    <button>Post comment</button>
-  </form>
-  <a href="/comments">View comments</a>
+<section class="section">
+  <h2>Featured products</h2>
+  <div class="grid">`)
+	for _, p := range fakeProducts {
+		fmt.Fprintf(w, `<a class="card" href="/products?id=%d"><div class="card-title">%s</div><div class="card-price">$%.2f</div></a>`, p.ID, p.Name, p.Price)
+	}
+	fmt.Fprint(w, `</div>
+</section>
 
-  <h2>SQL injection - login</h2>
-  <form action="/login" method="post">
-    <input name="username" value="admin">
-    <input name="password" type="password" value="wrong">
-    <button>Login</button>
-  </form>
+<section class="section split">
+  <div class="card">
+    <h2>Personalize your welcome message</h2>
+    <form action="/render" method="get" class="form-inline">
+      <input name="name" placeholder="Your name">
+      <button class="btn">Preview</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Refer a friend</h2>
+    <p>Give $10, get $10.</p>
+    <a class="btn" href="/transfer?to=friend@example.com&amp;amount=10">Send referral credit</a>
+  </div>
+</section>
 
-  <h2>SQL injection - products</h2>
-  <a href="/products?id=1">/products?id=1</a>
+<section class="section">
+  <h2>What customers are saying</h2>`)
 
-  <h2>Fake path traversal</h2>
-  <a href="/files?name=report.txt">/files?name=report.txt</a> |
-  <a href="/files?name=../../../../etc/passwd">/files?name=../../../../etc/passwd</a>
+	commentsMu.Lock()
+	start := 0
+	if len(comments) > 2 {
+		start = len(comments) - 2
+	}
+	for _, c := range comments[start:] {
+		fmt.Fprintf(w, `<div class="comment"><b>%s</b>: %s</div>`, c.Author, c.Body)
+	}
+	commentsMu.Unlock()
+	fmt.Fprint(w, `<a href="/comments">Read all reviews &rarr;</a>
+</section>`)
 
-  <h2>Open redirect</h2>
-  <a href="/redirect?url=https://example.com">/redirect?url=https://example.com</a>
-
-  <h2>IDOR</h2>
-  <a href="/profile?id=1">/profile?id=1</a>
-
-  <h2>Broken access control</h2>
-  <a href="/admin">/admin</a> (set cookie role=admin to bypass)
-
-  <h2>Sensitive data exposure</h2>
-  <a href="/api/config">/api/config</a> | <a href="/.env">/.env</a> | <a href="/uploads/">/uploads/</a>
-
-  <h2>CORS misconfiguration</h2>
-  <a href="/api/data">/api/data</a>
-
-  <h2>Fake command injection</h2>
-  <a href="/ping?host=127.0.0.1">/ping?host=127.0.0.1</a>
-
-  <h2>Fake SSTI</h2>
-  <a href="/render?name=Guest">/render?name=Guest</a>
-
-  <h2>CSRF</h2>
-  <a href="/transfer?to=attacker&amp;amount=100">/transfer?to=attacker&amp;amount=100</a>
-
-  <h2>SSRF</h2>
-  <a href="/fetch?url=http://localhost:8080/internal/metadata">/fetch?url=http://localhost:8080/internal/metadata</a>
-
-  <h2>Stack trace disclosure</h2>
-  <a href="/crash?tenant=acme">/crash?tenant=acme</a>
-
-  <script src="/static/app.js"></script>
-</body>
-</html>`)
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
@@ -104,24 +130,28 @@ func handleEnvFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------
-// Reflected XSS
+// Reflected XSS (site search)
 // ---------------------------------------------------------------------
 
 func handleSearchXSS(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// Intentionally unescaped: the query is written straight into the
-	// response body.
-	fmt.Fprintf(w, `<!DOCTYPE html><html><body>
-<h1>Search results</h1>
-<p>You searched for: %s</p>
-<p>No results found.</p>
-<a href="/">Home</a>
-</body></html>`, q)
+	fmt.Fprint(w, pageHeader("Search"))
+	fmt.Fprint(w, `<h1>Search our catalog</h1>
+<form action="/search" method="get">
+  <input name="q" placeholder="e.g. widget" value="`+q+`">
+  <button class="btn">Search</button>
+</form>`)
+	if q != "" {
+		// Intentionally unescaped: the query is written straight into
+		// the response body, as if to say "no results, did you mean...".
+		fmt.Fprintf(w, `<p>No results found for: %s</p>`, q)
+	}
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
-// Stored XSS (guestbook)
+// Stored XSS ("customer reviews")
 // ---------------------------------------------------------------------
 
 func handleComments(w http.ResponseWriter, r *http.Request) {
@@ -137,7 +167,8 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!DOCTYPE html><html><body><h1>Guestbook</h1>`)
+	fmt.Fprint(w, pageHeader("Reviews"))
+	fmt.Fprint(w, `<h1>Customer reviews</h1>`)
 
 	commentsMu.Lock()
 	for _, c := range comments {
@@ -147,13 +178,13 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 	commentsMu.Unlock()
 
 	fmt.Fprint(w, `
+<h2>Leave a review</h2>
 <form action="/comments" method="post">
-  <input name="author" placeholder="name">
-  <input name="body" placeholder="comment">
-  <button>Post</button>
-</form>
-<a href="/">Home</a>
-</body></html>`)
+  <input name="author" placeholder="Your name">
+  <input name="body" placeholder="Your review">
+  <button class="btn">Post review</button>
+</form>`)
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
@@ -163,11 +194,16 @@ func handleComments(w http.ResponseWriter, r *http.Request) {
 
 func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Sign in"))
 
 	if r.Method != http.MethodPost {
-		fmt.Fprint(w, `<form action="/login" method="post">
-<input name="username"><input name="password" type="password"><button>Login</button>
+		fmt.Fprint(w, `<h1>Sign in</h1>
+<form action="/login" method="post">
+  <input name="username" placeholder="Username">
+  <input name="password" type="password" placeholder="Password">
+  <button class="btn">Sign in</button>
 </form>`)
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 
@@ -183,8 +219,8 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(query)
 	if err != nil {
 		// Error-based SQLi: the raw database error is reflected back.
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "<pre>SQL error: %s\nquery: %s</pre>", err.Error(), query)
+		fmt.Fprintf(w, "<pre>Sign-in failed: %s</pre>", err.Error())
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 	defer rows.Close()
@@ -199,7 +235,8 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "role", Value: role})
 		http.SetCookie(w, &http.Cookie{Name: "username", Value: uname})
 
-		fmt.Fprintf(w, "<p>Welcome, %s! Role: %s</p><a href=\"/\">Home</a>", uname, role)
+		fmt.Fprintf(w, `<h1>Welcome back, %s</h1><p><a href="/account?id=%d">Go to my account</a></p>`, uname, id)
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 
@@ -208,30 +245,38 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	existsQuery := fmt.Sprintf("SELECT 1 FROM users WHERE username='%s'", username)
 	existsRows, err := db.Query(existsQuery)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "<pre>SQL error: %s\nquery: %s</pre>", err.Error(), existsQuery)
+		fmt.Fprintf(w, "<pre>Sign-in failed: %s</pre>", err.Error())
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 	defer existsRows.Close()
 
 	if existsRows.Next() {
-		fmt.Fprint(w, "<p>Incorrect password.</p>")
+		fmt.Fprint(w, "<p>That password doesn't look right. Please try again.</p>")
 	} else {
-		fmt.Fprint(w, "<p>No such user.</p>")
+		fmt.Fprint(w, "<p>We couldn't find an account with that username.</p>")
 	}
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
-// SQL injection - products (numeric context, UNION-based)
+// SQL injection - product catalog (numeric context, UNION-based)
 // ---------------------------------------------------------------------
 
 func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	if id == "" {
-		id = "1"
-	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Products"))
+
+	if id == "" {
+		fmt.Fprint(w, `<section class="section"><h1>Our products</h1><div class="grid">`)
+		for _, p := range fakeProducts {
+			fmt.Fprintf(w, `<a class="card" href="/products?id=%d"><div class="card-title">%s</div><div class="card-price">$%.2f</div></a>`, p.ID, p.Name, p.Price)
+		}
+		fmt.Fprint(w, `</div></section>`)
+		fmt.Fprint(w, pageFooter)
+		return
+	}
 
 	// Deliberately vulnerable: numeric parameter spliced in without
 	// quoting or validation, enabling UNION-based injection, e.g.
@@ -240,24 +285,35 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "<pre>SQL error: %s\nquery: %s</pre>", err.Error(), query)
+		fmt.Fprintf(w, "<pre>Couldn't load that product: %s</pre>", err.Error())
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 	defer rows.Close()
 
-	fmt.Fprint(w, "<table border=1><tr><th>ID</th><th>Name</th><th>Price</th></tr>")
+	fmt.Fprint(w, `<section class="section"><h1>Product details</h1><table><tr><th>ID</th><th>Name</th><th>Price</th></tr>`)
+	var firstName string
 	for rows.Next() {
 		var colID sql.NullString
 		var name sql.NullString
 		var price sql.NullString
 		if err := rows.Scan(&colID, &name, &price); err != nil {
-			fmt.Fprintf(w, "<tr><td colspan=3>scan error: %s</td></tr>", err.Error())
+			fmt.Fprintf(w, "<tr><td colspan=3>%s</td></tr>", err.Error())
 			continue
+		}
+		if firstName == "" {
+			firstName = name.String
 		}
 		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td></tr>", colID.String, name.String, price.String)
 	}
-	fmt.Fprint(w, "</table><a href=\"/\">Home</a>")
+	fmt.Fprint(w, "</table>")
+
+	if firstName != "" {
+		slug := strings.ToLower(strings.ReplaceAll(firstName, " ", "-"))
+		fmt.Fprintf(w, `<p><a href="/files?name=%s-spec.txt">Download spec sheet</a></p>`, slug)
+	}
+	fmt.Fprint(w, "</section>")
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
@@ -284,8 +340,11 @@ func handleFilesTraversal(w http.ResponseWriter, r *http.Request) {
 
 	// Non-traversal path: serve a small set of "legitimate" sample files.
 	safeFiles := map[string]string{
-		"report.txt": "Quarterly report: everything is fine.\n",
-		"readme.txt": "This is a sample file served by /files.\n",
+		"widget-spec.txt": "Widget - 10x10cm, 250g, aluminium. Rated for warehouse use.\n",
+		"gadget-spec.txt": "Gadget - 5x5cm, 80g, ABS plastic. Batteries not included.\n",
+		"gizmo-spec.txt":  "Gizmo - 15x8cm, 400g, steel. Ships in a reinforced box.\n",
+		"report.txt":      "Quarterly report: everything is fine.\n",
+		"readme.txt":      "This is a sample file served by /files.\n",
 	}
 	if content, ok := safeFiles[base]; ok {
 		fmt.Fprint(w, content)
@@ -297,7 +356,7 @@ func handleFilesTraversal(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------
-// Open redirect
+// Open redirect ("partner network" link)
 // ---------------------------------------------------------------------
 
 func handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
@@ -310,7 +369,35 @@ func handleOpenRedirect(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------
-// IDOR
+// My Account page: a normal-looking page whose inline script quietly
+// calls the IDOR-vulnerable /profile API to fill itself in.
+// ---------------------------------------------------------------------
+
+func handleAccountPage(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = "1"
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("My Account"))
+	fmt.Fprintf(w, `<h1>My account</h1>
+<div id="account">Loading your details&hellip;</div>
+<script>
+fetch('/profile?id=%s')
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    document.getElementById('account').innerHTML =
+      '<p>Username: ' + d.username + '</p>' +
+      '<p>Email: ' + d.email + '</p>' +
+      '<p>Address: ' + d.address + '</p>';
+  });
+</script>`, id)
+	fmt.Fprint(w, pageFooter)
+}
+
+// ---------------------------------------------------------------------
+// IDOR: the JSON API the account page above calls, with no check that
+// the caller is allowed to see this particular id.
 // ---------------------------------------------------------------------
 
 func handleProfileIDOR(w http.ResponseWriter, r *http.Request) {
@@ -322,8 +409,6 @@ func handleProfileIDOR(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// No check that the caller is authorized to view this profile: any
-	// id can be enumerated to dump every user's PII.
 	for _, u := range fakeUsers {
 		if u.ID == id {
 			json.NewEncoder(w).Encode(map[string]any{
@@ -346,18 +431,29 @@ func handleProfileIDOR(w http.ResponseWriter, r *http.Request) {
 
 func handleAdminBrokenAccess(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie("role")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
 	if err != nil || cookie.Value != "admin" {
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, "403 Forbidden")
+		fmt.Fprint(w, pageHeader("Staff Portal"))
+		fmt.Fprint(w, `<h1>Staff portal</h1><p>Please <a href="/login">sign in</a> with a staff account to continue.</p>`)
+		fmt.Fprint(w, pageFooter)
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, "<h1>Admin panel</h1><table border=1><tr><th>ID</th><th>Username</th><th>Password</th><th>Role</th></tr>")
+	fmt.Fprint(w, pageHeader("Staff Portal"))
+	fmt.Fprint(w, `<h1>Staff portal</h1><h2>Customers</h2><table border=1><tr><th>ID</th><th>Username</th><th>Password</th><th>Role</th></tr>`)
 	for _, u := range fakeUsers {
 		fmt.Fprintf(w, "<tr><td>%d</td><td>%s</td><td>%s</td><td>%s</td></tr>", u.ID, u.Username, u.Password, u.Role)
 	}
-	fmt.Fprint(w, "</table>")
+	fmt.Fprint(w, `</table>
+<h2>Import product image</h2>
+<p>Paste a URL and we'll pull the image into the catalog.</p>
+<form action="/fetch" method="get">
+  <input name="url" placeholder="https://cdn.example.com/widget.png" style="width:300px">
+  <button class="btn">Import</button>
+</form>`)
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
@@ -368,11 +464,11 @@ func handleAPIConfigExposure(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Api-Key", "sk_live_FAKE1234567890abcdef")
 	json.NewEncoder(w).Encode(map[string]any{
-		"debug":        true,
-		"version":      "0.1.0-dev",
-		"database_dsn": "postgres://vulnapp:SuperSecretDBPass!@localhost:5432/vulnapp",
-		"internal_api_key": "fake-internal-key-7788990011",
-		"jwt_secret":   "changeme",
+		"debug":             true,
+		"version":           "0.1.0-dev",
+		"database_dsn":      "postgres://vulnapp:SuperSecretDBPass!@localhost:5432/vulnapp",
+		"internal_api_key":  "fake-internal-key-7788990011",
+		"jwt_secret":        "changeme",
 	})
 }
 
@@ -397,9 +493,9 @@ func handleAPIDataCORS(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------
-// Fake command injection: looks like a shell-backed ping diagnostic but
-// never executes a real command. Time-based payloads (";sleep N") cause a
-// capped in-process delay instead of a real sleep(1) call, and
+// Fake command injection: looks like a shell-backed network diagnostic
+// but never executes a real command. Time-based payloads ("; sleep N")
+// cause a capped in-process delay instead of a real sleep(1) call, and
 // "echo TOKEN" payloads get their token reflected, so both classic
 // blind-command-injection detection techniques still work.
 // ---------------------------------------------------------------------
@@ -412,59 +508,76 @@ var (
 func handlePingCmdInjection(w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Query().Get("host")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Network Status"))
+	fmt.Fprint(w, `<h1>Network status</h1>
+<p>Check connectivity to one of our regional warehouses.</p>
+<form action="/ping" method="get">
+  <input name="host" placeholder="warehouse-east.acme.internal" value="`+host+`">
+  <button class="btn">Check</button>
+</form>`)
 
-	if m := sleepPattern.FindStringSubmatch(host); m != nil {
-		secs, _ := strconv.Atoi(m[1])
-		if secs > 10 {
-			secs = 10 // capped so this can never be used to hang the server
+	if host != "" {
+		if m := sleepPattern.FindStringSubmatch(host); m != nil {
+			secs, _ := strconv.Atoi(m[1])
+			if secs > 10 {
+				secs = 10 // capped so this can never be used to hang the server
+			}
+			time.Sleep(time.Duration(secs) * time.Second)
 		}
-		time.Sleep(time.Duration(secs) * time.Second)
-	}
 
-	echoOutput := ""
-	if m := echoPattern.FindStringSubmatch(host); m != nil {
-		echoOutput = "\n" + m[1]
-	}
+		echoOutput := ""
+		if m := echoPattern.FindStringSubmatch(host); m != nil {
+			echoOutput = "\n" + m[1]
+		}
 
-	// Intentionally unescaped reflection of the raw host value.
-	fmt.Fprintf(w, `<pre>PING %s: 1 packets transmitted, 1 received, 0%% packet loss%s</pre><a href="/">Home</a>`, host, echoOutput)
+		// Intentionally unescaped reflection of the raw host value.
+		fmt.Fprintf(w, `<pre>PING %s: 1 packets transmitted, 1 received, 0%% packet loss%s</pre>`, host, echoOutput)
+	}
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
-// Fake server-side template injection. The template body is built from
-// user input and parsed/executed with text/template; the exposed data
-// only has a Name field and a decoy SecretToken, and no functions are
-// registered, so this can leak the token but cannot reach the filesystem
-// or execute code.
+// Fake server-side template injection, behind a "preview your welcome
+// email" feature. The template body is built from user input and
+// parsed/executed with text/template; the exposed data only has a Name
+// field and a decoy SecretToken, and no functions are registered, so
+// this can leak the token but cannot reach the filesystem or execute
+// code.
 // ---------------------------------------------------------------------
 
 func handleRenderSSTI(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	if name == "" {
-		name = "Guest"
-	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Welcome Preview"))
+	fmt.Fprint(w, `<h1>Preview your welcome message</h1>
+<form action="/render" method="get">
+  <input name="name" placeholder="Your name" value="`+name+`">
+  <button class="btn">Preview</button>
+</form>`)
 
-	tmplText := "<h1>Hello, " + name + "!</h1>"
-	tmpl, err := template.New("render").Parse(tmplText)
-	if err != nil {
-		fmt.Fprintf(w, "<pre>template error: %s</pre>", err.Error())
-		return
+	if name != "" {
+		tmplText := "<p>Hello, " + name + "! Thanks for joining Acme Supplies.</p>"
+		tmpl, err := template.New("render").Parse(tmplText)
+		if err != nil {
+			fmt.Fprintf(w, "<pre>Couldn't render preview: %s</pre>", err.Error())
+		} else {
+			data := map[string]string{
+				"Name":        name,
+				"SecretToken": "fake-session-secret-9f8e7d6c",
+			}
+			if err := tmpl.Execute(w, data); err != nil {
+				fmt.Fprintf(w, "<pre>Couldn't render preview: %s</pre>", err.Error())
+			}
+		}
 	}
-
-	data := map[string]string{
-		"Name":        name,
-		"SecretToken": "fake-session-secret-9f8e7d6c",
-	}
-	if err := tmpl.Execute(w, data); err != nil {
-		fmt.Fprintf(w, "<pre>template execution error: %s</pre>", err.Error())
-	}
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
-// CSRF: a state-changing GET endpoint with no token/origin check.
-// Mutates only an in-memory demo balance (resets on restart).
+// CSRF: a state-changing GET endpoint ("send referral credit") with no
+// token/origin check. Mutates only an in-memory demo balance (resets on
+// restart).
 // ---------------------------------------------------------------------
 
 func handleTransferCSRF(w http.ResponseWriter, r *http.Request) {
@@ -481,14 +594,17 @@ func handleTransferCSRF(w http.ResponseWriter, r *http.Request) {
 	balanceMu.Unlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, "<p>Transferred %d to %s. New balance: %d</p><a href=\"/\">Home</a>", amount, to, newBalance)
+	fmt.Fprint(w, pageHeader("Referral Credit"))
+	fmt.Fprintf(w, "<h1>Referral credit sent</h1><p>Sent $%d to %s. Your remaining referral balance: $%d</p>", amount, to, newBalance)
+	fmt.Fprint(w, pageFooter)
 }
 
 // ---------------------------------------------------------------------
-// SSRF: makes a real outbound request to the attacker-supplied URL, but
-// bounded by a short timeout and a response size cap so it cannot be used
-// to exhaust server resources. /internal/metadata below gives it a safe,
-// self-contained target to demonstrate the classic
+// SSRF, behind the staff portal's "import product image from URL"
+// feature. Makes a real outbound request to the attacker-supplied URL,
+// but bounded by a short timeout and a response size cap so it cannot be
+// used to exhaust server resources. /internal/metadata below gives it a
+// safe, self-contained target to demonstrate the classic
 // "SSRF -> internal metadata disclosure" chain without touching anything
 // outside this process.
 // ---------------------------------------------------------------------
@@ -504,7 +620,7 @@ func handleFetchSSRF(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(target)
 	if err != nil {
-		fmt.Fprintf(w, "fetch error: %s", err.Error())
+		fmt.Fprintf(w, "couldn't import image: %s", err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -516,9 +632,9 @@ func handleFetchSSRF(w http.ResponseWriter, r *http.Request) {
 func handleInternalMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"instance_id":      "i-0fakeinstance00",
-		"iam_role":         "vulnapp-fake-role",
-		"access_key_id":    "AKIAFAKEFAKEFAKEFAKE",
+		"instance_id":       "i-0fakeinstance00",
+		"iam_role":          "vulnapp-fake-role",
+		"access_key_id":     "AKIAFAKEFAKEFAKEFAKE",
 		"secret_access_key": "FakeSecretAccessKeyDoNotUseThisIsADemoValue",
 	})
 }
