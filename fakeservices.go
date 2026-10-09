@@ -140,9 +140,71 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 		if err != nil {
 			return
 		}
-		log.Printf("%s connected to %s [T1133 External Remote Services]", conn.RemoteAddr(), ln.Addr())
+		log.Printf("%s connected to %s [T1133 External Remote Services | %s]", conn.RemoteAddr(), ln.Addr(), attackCategoryForAddr(ln.Addr().String()))
 		go handle(conn)
 	}
+}
+
+// portAttackCategory gives each fake service's port a plain-English
+// description of what kind of attack/exploitation attempt reaching it
+// actually represents, so the generic T1133 tag in acceptLoop isn't the
+// only thing the log line says. Grouped by the real-world risk class
+// each service family represents.
+var portAttackCategory = map[string]string{
+	":21":    "Unauthorized File Access Attempt",
+	":23":    "Unauthorized Remote Shell Access Attempt",
+	":6379":  "Unauthenticated Data Store Access Attempt",
+	":11211": "Unauthenticated Cache Access / DDoS Amplification Attempt",
+	":2181":  "Service Discovery Information Disclosure Attempt",
+	":3306":  "Database Exploitation Attempt",
+	":25":    "Mail Relay / Abuse Attempt", ":587": "Mail Relay / Abuse Attempt", ":465": "Mail Relay / Abuse Attempt",
+	":143": "Mail Credential Interception Attempt", ":993": "Mail Credential Interception Attempt",
+	":110": "Mail Credential Interception Attempt", ":995": "Mail Credential Interception Attempt",
+	":53":    "DNS Zone Transfer / Information Disclosure Attempt",
+	":5432":  "Database Exploitation Attempt",
+	":1433":  "Database Exploitation Attempt",
+	":3389":  "Remote Desktop Access Attempt",
+	":5900":  "Remote Desktop Access Attempt",
+	":27017": "Database Exploitation Attempt",
+	":1521":  "Database Exploitation Attempt",
+	":9042":  "Database Exploitation Attempt",
+	":9092":  "Message Queue Exploitation Attempt",
+	":5672":  "Message Queue Exploitation Attempt",
+	":61616": "Message Queue Exploitation Attempt",
+	":445":   "File Share / Lateral Movement Attempt",
+	":9200":  "Unauthenticated Search Index Access Attempt",
+	":2375":  "Container Escape / Remote Code Execution Attempt",
+	":5984":  "Database Exploitation Attempt",
+	":8500":  "Service Discovery Information Disclosure Attempt",
+	":3000":  "Monitoring Dashboard Information Disclosure Attempt",
+	":5601":  "Monitoring Dashboard Information Disclosure Attempt",
+	":9090":  "Monitoring Dashboard Information Disclosure Attempt",
+	":15672": "Default Credential / Message Queue Management Attempt",
+	":8086":  "Database Exploitation Attempt",
+	":8200":  "Secrets Management Exposure Attempt",
+	":8888":  "Remote Code Execution Attempt",
+	":10000": "Remote Code Execution Attempt",
+	":8761":  "Service Discovery Information Disclosure Attempt",
+	":8080":  "Remote Code Execution Attempt",
+	":9000":  "Container Management / Remote Code Execution Attempt",
+	":19999": "System Information Disclosure Attempt",
+	":5000":  "Container Image / Source Disclosure Attempt",
+	":8161":  "Remote Code Execution Attempt",
+	":8081":  "Artifact Repository / Source Disclosure Attempt",
+	":50070": "Cluster Information Disclosure Attempt",
+	":2379":  "Cluster Secrets Disclosure Attempt",
+	":6443":  "Kubernetes API Exploitation Attempt",
+	":10250": "Kubernetes Node Exploitation Attempt",
+	":5985":  "Remote Management / Lateral Movement Attempt",
+}
+
+func attackCategoryForAddr(addr string) string {
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		if cat, ok := portAttackCategory[addr[idx:]]; ok {
+			return cat
+		}
+	}
+	return "Exposed Service Access Attempt"
 }
 
 // startFTPService models the actual vulnerability behind an exposed
@@ -177,7 +239,7 @@ func handleFTPConn(conn net.Conn) {
 			// anonymous/anonymous or anonymous/blank convention) is
 			// accepted - there's no real auth check at all.
 			loggedIn = true
-			log.Printf("%s FTP login accepted [T1078.001 Valid Accounts: Default Accounts]", conn.RemoteAddr())
+			log.Printf("%s FTP login accepted [T1078.001 Valid Accounts: Default Accounts | Default/Weak Credential Access Attempt]", conn.RemoteAddr())
 			fmt.Fprint(conn, "230 Login successful.\r\n")
 		case strings.HasPrefix(upper, "SYST"):
 			fmt.Fprint(conn, "215 UNIX Type: L8\r\n")
@@ -188,7 +250,7 @@ func handleFTPConn(conn net.Conn) {
 				fmt.Fprint(conn, "530 Please login with USER and PASS.\r\n")
 				continue
 			}
-			log.Printf("%s FTP directory listing requested [T1005 Data from Local System]", conn.RemoteAddr())
+			log.Printf("%s FTP directory listing requested [T1005 Data from Local System | Unauthorized File Listing/Disclosure Attempt]", conn.RemoteAddr())
 			fmt.Fprint(conn, "150 Here comes the directory listing.\r\n")
 			fmt.Fprint(conn, "-rw-r--r--    1 ftp      ftp          4823 Jan 03  2024 backup.sql\r\n")
 			fmt.Fprint(conn, "-rw-r--r--    1 ftp      ftp           512 Jan 03  2024 config.old\r\n")
@@ -229,7 +291,7 @@ func handleTelnetConn(conn net.Conn) {
 	if !scanner.Scan() {
 		return
 	}
-	log.Printf("%s telnet login accepted with arbitrary credentials [T1078.001 Valid Accounts: Default Accounts]", conn.RemoteAddr())
+	log.Printf("%s telnet login accepted with arbitrary credentials [T1078.001 Valid Accounts: Default Accounts | Default/Weak Credential Access Attempt]", conn.RemoteAddr())
 
 	fmt.Fprint(conn, "\r\nWelcome to Ubuntu 16.04.6 LTS (GNU/Linux 4.4.0-104-generic x86_64)\r\n\r\n")
 	fmt.Fprint(conn, "acme-web01:~$ ")
@@ -239,7 +301,7 @@ func handleTelnetConn(conn net.Conn) {
 			fmt.Fprint(conn, "acme-web01:~$ ")
 			continue
 		}
-		log.Printf("%s telnet command: %q [T1059 Command and Scripting Interpreter]", conn.RemoteAddr(), cmd)
+		log.Printf("%s telnet command: %q [T1059 Command and Scripting Interpreter | Attempted Command Execution]", conn.RemoteAddr(), cmd)
 		if out := fakeShellOutput(cmd); out != "" {
 			fmt.Fprint(conn, out)
 		}
@@ -377,8 +439,9 @@ func startFakeHTTPService(addr string, handler http.HandlerFunc) {
 		log.Printf("fake service %s not started: %v", addr, err)
 		return
 	}
+	category := attackCategoryForAddr(addr)
 	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s %s [T1133 External Remote Services]", r.RemoteAddr, r.Method, r.URL.String())
+		log.Printf("%s %s %s [T1133 External Remote Services | %s]", r.RemoteAddr, r.Method, r.URL.String(), category)
 		handler(w, r)
 	})
 	srv := &http.Server{Handler: logged}

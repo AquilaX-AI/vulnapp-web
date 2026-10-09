@@ -226,28 +226,41 @@ binary-protocol databases/brokers:
 ## MITRE ATT&CK tagging in the logs
 
 Every contact with this app - a web request or a connection to any fake
-service above - gets logged with the client IP and, where the request
-matches a known signature, a best-fit [MITRE ATT&CK](https://attack.mitre.org/)
-technique, the same way a WAF/SIEM rule set tags traffic:
+service above - gets logged with the client IP, a best-fit
+[MITRE ATT&CK](https://attack.mitre.org/) technique, and a plain-English
+attack-type/exploitability label, the same way a WAF/SIEM rule set tags
+traffic:
 
 ```
-2026/01/15 09:12:03 203.0.113.7 POST /login [T1190 Exploit Public-Facing Application (SQL injection)]
-2026/01/15 09:12:05 203.0.113.7 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files]
-2026/01/15 09:12:08 203.0.113.7 connected to [::]:3306 [T1133 External Remote Services]
+2026/01/15 09:12:03 203.0.113.7 POST /login [T1190 Exploit Public-Facing Application | SQL Injection Attempt]
+2026/01/15 09:12:05 203.0.113.7 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files | Credential/Secrets Exposure Attempt]
+2026/01/15 09:12:08 203.0.113.7 connected to [::]:3306 [T1133 External Remote Services | Database Exploitation Attempt]
 ```
 
-[`mitre.go`](mitre.go) holds the classifier: it inspects the path, query
-string, form body (read and restored, so the real handler still sees it
-normally), and `User-Agent` against a prioritized set of regex
-signatures - SQL injection, XSS, path traversal, command/template
+The MITRE technique name is intentionally abstract (the real ATT&CK
+technique "Exploit Public-Facing Application" covers SQLi, SSTI, and a
+lot else) - the part after the `|` is this app's own label for what kind
+of attack that specific match actually represents, so the line is
+readable without a MITRE lookup.
+
+[`mitre.go`](mitre.go) holds the web-request classifier: it inspects the
+path, query string, form body (read and restored, so the real handler
+still sees it normally), and `User-Agent` against a prioritized set of
+regex signatures - SQL injection, XSS, path traversal, command/template
 injection, credential/cloud-metadata file hits, mass-assignment writes,
 brute-force attempts against `/login`/`/reset-password`, and known
 scanner User-Agents - and returns the first match. The fake TCP/HTTP
-services tag every connection as `T1133 External Remote Services`
-uniformly, plus a couple of more specific tags for particular commands
-(SMTP `VRFY` -> `T1087 Account Discovery`, FTP/Telnet login -> `T1078.001
-Valid Accounts: Default Accounts`, IMAP/POP3 plaintext auth -> `T1040
-Network Sniffing`, DNS `AXFR` -> `T1018 Remote System Discovery`).
+services tag every connection as `T1133 External Remote Services`, with
+the category label varying by port/service family (`portAttackCategory`
+in [`fakeservices.go`](fakeservices.go) - e.g. "Database Exploitation
+Attempt" for the DB ports, "Remote Code Execution Attempt" for
+Jenkins/Jupyter/Webmin), plus a few more specific MITRE tags for
+particular commands (SMTP `VRFY` -> `T1087 Account Discovery` | User
+Enumeration Attempt, FTP/Telnet login -> `T1078.001 Valid Accounts:
+Default Accounts` | Default/Weak Credential Access Attempt, IMAP/POP3
+plaintext auth -> `T1040 Network Sniffing` | Plaintext Credential
+Interception Risk, DNS `AXFR` -> `T1018 Remote System Discovery` | DNS
+Zone Transfer / Information Disclosure Attempt).
 
 This is advisory classification from a single request in isolation, the
 same limitation any signature-based detector has - it's meant to make

@@ -70,11 +70,11 @@ func handleSMTPConn(conn net.Conn) {
 		case strings.HasPrefix(upper, "RCPT TO"):
 			// The bug: accepted regardless of the recipient's domain -
 			// a real open relay would let this message go anywhere.
-			log.Printf("%s SMTP RCPT TO %s accepted (open relay) [T1133 External Remote Services]", conn.RemoteAddr(), strings.TrimSpace(line[7:]))
+			log.Printf("%s SMTP RCPT TO %s accepted (open relay) [T1133 External Remote Services | Open Mail Relay Abuse Attempt]", conn.RemoteAddr(), strings.TrimSpace(line[7:]))
 			fmt.Fprint(conn, "250 2.1.5 Ok\r\n")
 		case strings.HasPrefix(upper, "VRFY"):
 			user := strings.TrimSpace(line[4:])
-			log.Printf("%s SMTP VRFY %q [T1087 Account Discovery]", conn.RemoteAddr(), user)
+			log.Printf("%s SMTP VRFY %q [T1087 Account Discovery | User Enumeration Attempt]", conn.RemoteAddr(), user)
 			if knownMailUser(user) {
 				fmt.Fprintf(conn, "250 2.0.0 <%s@acme-supplies.internal>\r\n", strings.Trim(user, "<>"))
 			} else {
@@ -145,7 +145,7 @@ func handleIMAPConn(conn net.Conn) {
 			fmt.Fprint(conn, "* CAPABILITY IMAP4rev1 LOGIN-REFERRALS AUTH=PLAIN AUTH=LOGIN\r\n")
 			fmt.Fprintf(conn, "%s OK CAPABILITY completed\r\n", tag)
 		case "LOGIN":
-			log.Printf("%s IMAP plaintext LOGIN accepted [T1040 Network Sniffing]", conn.RemoteAddr())
+			log.Printf("%s IMAP plaintext LOGIN accepted [T1040 Network Sniffing | Plaintext Credential Interception Risk]", conn.RemoteAddr())
 			fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
 		case "LOGOUT":
 			fmt.Fprint(conn, "* BYE IMAP4rev1 Server logging out\r\n")
@@ -181,7 +181,7 @@ func handlePOP3Conn(conn net.Conn) {
 		case strings.HasPrefix(upper, "USER"):
 			fmt.Fprint(conn, "+OK User accepted\r\n")
 		case strings.HasPrefix(upper, "PASS"):
-			log.Printf("%s POP3 plaintext PASS accepted [T1040 Network Sniffing]", conn.RemoteAddr())
+			log.Printf("%s POP3 plaintext PASS accepted [T1040 Network Sniffing | Plaintext Credential Interception Risk]", conn.RemoteAddr())
 			fmt.Fprint(conn, "+OK Logged in\r\n")
 		case strings.HasPrefix(upper, "STAT"):
 			fmt.Fprint(conn, "+OK 0 0\r\n")

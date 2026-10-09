@@ -61,7 +61,7 @@ func handleDNSConn(conn net.Conn) {
 		return
 	}
 
-	log.Printf("%s DNS AXFR request for zone %q [T1018 Remote System Discovery]", conn.RemoteAddr(), qname)
+	log.Printf("%s DNS AXFR request for zone %q [T1018 Remote System Discovery | DNS Zone Transfer / Information Disclosure Attempt]", conn.RemoteAddr(), qname)
 
 	records := buildFakeZoneRecords(qname)
 	resp := dnsHeader(id, 0, 1, uint16(len(records)), 0, 0)
@@ -174,13 +174,13 @@ func buildFakeZoneRecords(zone string) [][]byte {
 	mxRdata := append(uint16Bytes(10), encodeDomainName("mail."+zone)...)
 
 	return [][]byte{
-		buildRR(zone, 6, soaRdata),                                      // SOA
-		buildRR(zone, 2, encodeDomainName("ns1."+zone)),                 // NS
-		buildRR(zone, 15, mxRdata),                                      // MX
-		buildRR("mail."+zone, 1, net.ParseIP("10.0.4.23").To4()),        // A
-		buildRR("db."+zone, 1, net.ParseIP("10.0.4.23").To4()),          // A
-		buildRR("vpn."+zone, 1, net.ParseIP("192.168.56.10").To4()),     // A
-		buildRR("ns1."+zone, 1, net.ParseIP("192.168.56.10").To4()),     // A
-		buildRR(zone, 6, soaRdata),                                      // closing SOA (AXFR convention)
+		buildRR(zone, 6, soaRdata),                                  // SOA
+		buildRR(zone, 2, encodeDomainName("ns1."+zone)),             // NS
+		buildRR(zone, 15, mxRdata),                                  // MX
+		buildRR("mail."+zone, 1, net.ParseIP("10.0.4.23").To4()),    // A
+		buildRR("db."+zone, 1, net.ParseIP("10.0.4.23").To4()),      // A
+		buildRR("vpn."+zone, 1, net.ParseIP("192.168.56.10").To4()), // A
+		buildRR("ns1."+zone, 1, net.ParseIP("192.168.56.10").To4()), // A
+		buildRR(zone, 6, soaRdata),                                  // closing SOA (AXFR convention)
 	}
 }
