@@ -1,0 +1,8 @@
+; old config, superseded, left here by mistake (fake, for demo purposes)
+[database]
+host=db.internal
+user=vulnapp
+password=SuperSecretDBPass!
+
+[smtp]
+password=FakeSmtpPassword2024

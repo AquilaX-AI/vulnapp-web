@@ -1,0 +1,32 @@
+body {
+  font-family: -apple-system, Helvetica, Arial, sans-serif;
+  max-width: 760px;
+  margin: 2rem auto;
+  line-height: 1.5;
+  color: #222;
+}
+
+h1 {
+  border-bottom: 2px solid #c0392b;
+  padding-bottom: 0.3rem;
+}
+
+h2 {
+  margin-top: 1.5rem;
+  color: #2c3e50;
+}
+
+form {
+  margin: 0.5rem 0;
+}
+
+input {
+  margin-right: 0.3rem;
+  padding: 0.2rem;
+}
+
+.comment {
+  border: 1px solid #ddd;
+  padding: 0.4rem;
+  margin: 0.4rem 0;
+}

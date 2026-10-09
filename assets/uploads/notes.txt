@@ -1,0 +1,5 @@
+internal notes - do not share
+
+- admin panel bypass still works by setting cookie role=admin, need to fix before GA (never will, this is a demo app)
+- staging VPN password is "FakeVpnPass!2024" (fake, for demo)
+- remember to rotate the backup.sql password dump above
