@@ -160,11 +160,12 @@ a real deployment, should never be reachable - the network-level version
 of the same idea, for port scanners (nmap, masscan) and recon tooling
 (Shodan-style dorking) to find. None of these implement the real
 protocol beyond a first-contact banner or response; see
-[`fakeservices.go`](fakeservices.go).
+[`fakeservices.go`](fakeservices.go). Port 22 (SSH) is deliberately left
+alone rather than faked, since a real SSH server commonly runs there for
+box/VM management and this app should never contend with it for the port.
 
 | Port | Pretends to be | Fidelity |
 |---|---|---|
-| 22 | SSH (OpenSSH 7.2p2 Ubuntu) | Real identification string, sent the way SSH actually does (before any key exchange) |
 | 21 | FTP (vsFTPd 2.3.4) | **Stateful**: accepts anonymous login (any USER/PASS) and lists real-looking sensitive files via `LIST` |
 | 23 | Telnet | **Stateful**: a light interactive honeypot - accepts any credentials, then answers common recon commands (`whoami`, `id`, `uname`, `ls`, ...) and logs every command typed |
 | 3306 | MySQL 5.5.8 | Real binary protocol greeting packet |

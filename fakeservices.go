@@ -25,10 +25,10 @@ func startFakeServices() {
 	// Plaintext/line-based protocols: old, vulnerable-sounding version
 	// strings on purpose, matching the rest of the app's "ancient stack"
 	// theme.
-	// SSH sends its identification string immediately on connect, before
-	// any key exchange - a real, old, vulnerable-history OpenSSH version
-	// fingerprints just as easily as any plaintext banner.
-	startBannerService(":22", "SSH-2.0-OpenSSH_7.2p2 Ubuntu-4ubuntu2.8\r\n", nil)
+	//
+	// Port 22 (SSH) is deliberately not faked here: a real SSH server
+	// commonly runs there (e.g. for VM/box management), and this app
+	// should never compete with it for the port.
 	startFTPService(":21")
 	startTelnetService(":23")
 	startBannerService(":6379", "", redisReply)
