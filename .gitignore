@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# vulnapp-web runtime artifacts
+/logs.csv

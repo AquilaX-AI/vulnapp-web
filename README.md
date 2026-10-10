@@ -69,6 +69,7 @@ HTTP_ADDR=:8080 HTTPS_ADDR=:8443 go run .
 | `SYSLOG_ADDR`    | *(none)* | `host:port` of a real syslog/SIEM destination to forward every log line to (RFC 5424) |
 | `SYSLOG_PROTO`   | `udp`    | `udp` or `tcp`, for `SYSLOG_ADDR`                    |
 | `CTI_API_KEY`    | *(none)* | [OneFirewall](https://onefirewall.co.uk) threat-intel API key - if set, reports attacker IPs there (see below) |
+| `CSV_LOG_PATH`   | `logs.csv` | Where every attack-tagged event gets appended as a CSV row - on by default, no setup needed (see below) |
 
 The HTTPS listener mints a fresh self-signed certificate on the fly for
 *whatever* hostname the client asks for via SNI (CN + `<host>` +
@@ -284,7 +285,7 @@ traffic:
 ```
 2026/01/15 09:12:03 203.0.113.7:51234 POST /login [T1190 Exploit Public-Facing Application | SQL Injection Attempt] proto=http ua="sqlmap/1.7" referer="-" xff="-" content_length=33 body="username=admin%27+OR+%271%27%3D%271&password=x"
 2026/01/15 09:12:05 203.0.113.7:51235 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files | Credential/Secrets Exposure Attempt] proto=http ua="curl/8.1.2" referer="-" xff="-" content_length=0 body="-"
-2026/01/15 09:12:08 203.0.113.7:51236 connected to [::]:3306 [T1133 External Remote Services | Database Exploitation Attempt]
+2026/01/15 09:12:08 203.0.113.7:51236 connected to [::]:3306 [T1133 External Remote Services | Database Exploitation Attempt] dest=[::]:3306 proto=tcp
 ```
 
 The MITRE technique name is intentionally abstract (the real ATT&CK
@@ -303,6 +304,32 @@ hostname *this specific deployment* answers to - exactly what should
 stay anonymous if these logs get exported or shared with a threat-intel
 feed. (Sent a request with `Host: totally-real-internal-hostname.corp.
 acme.com` during testing - confirmed it never appears in the log line.)
+
+### Attack log (CSV)
+
+Every attack-tagged event - web or any fake service - also gets appended
+as one row to `logs.csv` (or wherever `CSV_LOG_PATH` points), on by
+default with no setup needed ([`csvlog.go`](csvlog.go)):
+
+```
+timestamp,ip,source_port,destination_port,protocol,service,user_agent,mitre_code,mitre_name,attempt,details,notes
+2026-01-15T09:12:03Z,203.0.113.7,51234,80,http,Acme Supplies Web App (HTTP),"sqlmap/1.7",T1190,Exploit Public-Facing Application,SQL Injection Attempt,"POST /login ...","2026/01/15 09:12:03 203.0.113.7:51234 POST /login [T1190 ...] ..."
+2026-01-15T09:12:08Z,203.0.113.7,51236,3306,tcp,MySQL,,T1133,External Remote Services,Database Exploitation Attempt,"connected to [::]:3306 ...","2026/01/15 09:12:08 203.0.113.7:51236 connected to [::]:3306 [T1133 ...] ..."
+```
+
+`destination_port`, `protocol`, `service`, and `user_agent` aren't always
+present in the specific log line that triggered a row - a Telnet command
+or an MQTT PUBLISH, for instance, only logs the attack-relevant detail,
+not the connection's destination. Those get backfilled from a short-lived
+cache keyed by source address, populated by that connection's first line
+(every fake TCP/HTTP service logs a "connected to ..."/request line with
+full destination info up front). `details` is the log message with the
+MITRE tag and IP stripped out; `notes` is the full original line,
+verbatim, as a catch-all. Every field is defused against spreadsheet
+formula injection (a leading `=`/`+`/`-`/`@` gets a `'` prefix) before
+being written, since several of them - `user_agent` especially - are
+attacker-controlled and this file is meant to be opened directly in
+Excel/Sheets.
 
 ### Forwarding to real syslog
 
