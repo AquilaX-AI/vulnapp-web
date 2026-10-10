@@ -262,6 +262,12 @@ var portAttackCategory = map[string]string{
 	":4436":  "Edge VPN Appliance Exploitation Attempt",
 	":8291":  "Network Device Management Access Attempt",
 	":8728":  "Network Device Management Access Attempt",
+	":102":   "Unauthenticated ICS/SCADA (Siemens S7) Access Attempt",
+	":4840":  "Unauthenticated OPC UA Server Access Attempt",
+	":8070":  "Unauthenticated IP Camera Access Attempt",
+	":8090":  "Unauthenticated DVR/NVR Access Attempt",
+	":37777": "Unauthenticated DVR/NVR Access Attempt",
+	":9100":  "Unauthenticated Network Printer Access Attempt",
 }
 
 func attackCategoryForAddr(addr string) string {

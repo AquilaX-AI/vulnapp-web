@@ -261,6 +261,17 @@ And the IoT/ICS/medical protocol families actually driving most internet-wide sc
 
 `wp-login.php`, `xmlrpc.php`, and `wp-json/` are also faked directly on the main app's own ports ([`handlers.go`](handlers.go)) - not because this is a WordPress site, but because WordPress's market share means these paths get scanned on essentially every site regardless of what it actually runs. `xmlrpc.php`'s `system.listMethods` and `wp.getUsersBlogs`/`system.multicall` get distinct tags, since the latter is specifically the pingback-abuse/credential-brute-force vector XML-RPC is best known for.
 
+Two more industrial protocols ([`icsservices.go`](icsservices.go)) and the camera/DVR/printer side of IoT exposure ([`iotdevices.go`](iotdevices.go)), researched the same way: a joint NSA/CISA/FBI/DOE/EPA advisory (AA26-231A, Aug 2026) warned of AI-written scripts attacking internet-exposed Siemens S7 PLCs, with "take any S7 PLC on port 102 offline immediately" as its first recommendation; Bitsight found 14,220 exposed OPC UA devices, 7,358 accepting anonymous connections; and a campaign called "CameraSwarm" compromised 14,530+ Dahua cameras/DVRs in June-July 2026 via port 37777 and two CVSS 9.8 auth-bypass CVEs, while 80,000+ Hikvision cameras remain vulnerable to CVE-2021-36260:
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 102 | Siemens S7 PLC (S7comm) | A real TPKT/COTP/S7 "Setup Communication" handshake - verified with `python-snap7` (the library real S7 tooling is built on) reporting `get_connected(): True`. Caught and fixed a real bug here: the handshake bytes were correct on the first attempt, but closing the connection right after it made `snap7` report itself disconnected anyway - a real S7 session stays open for further requests |
+| 4840 | OPC UA server | Real Hello/Acknowledge (UACP) handshake only, not a full session - honestly scoped, since a full session needs certificate/nonce exchange well beyond what mass internet-wide scanners actually check for. Verified with `asyncua`'s real client: it accepted our Acknowledge with no protocol error and progressed to the next stage, which isn't implemented |
+| 8070 | Hikvision ISAPI | Fake `deviceInfo` (names the exact pre-fix firmware range for CVE-2021-36260) and `/ISAPI/Security/users` - the exact two endpoints a July 2026 report described being actively scanned |
+| 8090 | Dahua NetSurveillance WEB | Login page naming a firmware version |
+| 37777 | Dahua DHIP (proprietary) | Port accepts the connection and stays silent - undocumented binary protocol, no trusted client available to verify a fuller fake against |
+| 9100 | Raw/JetDirect network printing | Logs whatever's sent with no reply - that's the real protocol: a printer is a pure data sink, nothing to parse or respond to |
+
 ## MITRE ATT&CK tagging in the logs
 
 Every contact with this app - a web request or a connection to any fake
@@ -460,7 +471,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **119 findings across 18 rule IDs**, including:
+reports **132 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|

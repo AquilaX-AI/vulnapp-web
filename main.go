@@ -140,6 +140,8 @@ func main() {
 	startUDPServices()
 	startAIServices()
 	startIoTServices()
+	startICSServices()
+	startIoTDeviceServices()
 	startRateDetectCleanup()
 
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")
