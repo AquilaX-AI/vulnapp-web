@@ -27,26 +27,47 @@ func generateInstanceID() string {
 	return "vulnapp-" + hex.EncodeToString(b)
 }
 
-// initSyslog wires a real syslog (RFC 5424) forwarder into Go's standard
-// log package if SYSLOG_ADDR is set, so every existing log.Printf call
-// in this codebase - no per-call-site changes needed - also reaches a
-// real syslog/SIEM destination, in addition to stderr. Disabled by
-// default: with no SYSLOG_ADDR, logging behaves exactly as before.
-func initSyslog() {
+// initLogging composes every configured log sink - stderr always, plus
+// syslog and/or OneFirewall threat-intel reporting if their env vars are
+// set - into the one io.Writer Go's standard log package uses. Every
+// existing log.Printf call site in this codebase - no per-call-site
+// changes needed - reaches all of them. With nothing configured, logging
+// behaves exactly as before (stderr only).
+func initLogging() {
+	writers := []io.Writer{os.Stderr}
+	var enabled []string
+
+	if w, desc := syslogOutput(); w != nil {
+		writers = append(writers, w)
+		enabled = append(enabled, desc)
+	}
+	if w, desc := oneFirewallOutput(); w != nil {
+		writers = append(writers, w)
+		enabled = append(enabled, desc)
+	}
+
+	if len(writers) > 1 {
+		log.SetOutput(io.MultiWriter(writers...))
+		log.Printf("logging sinks enabled: %s (instance id %s)", strings.Join(enabled, ", "), instanceID)
+	}
+}
+
+// syslogOutput returns a writer forwarding to a real syslog (RFC 5424)
+// destination if SYSLOG_ADDR is set, or (nil, "") if it isn't.
+func syslogOutput() (io.Writer, string) {
 	addr := os.Getenv("SYSLOG_ADDR")
 	if addr == "" {
-		return
+		return nil, ""
 	}
 	proto := getenvDefault("SYSLOG_PROTO", "udp")
 
 	conn, err := net.Dial(proto, addr)
 	if err != nil {
 		log.Printf("syslog forwarding to %s not started: %v", addr, err)
-		return
+		return nil, ""
 	}
 
-	log.SetOutput(io.MultiWriter(os.Stderr, &syslogWriter{conn: conn}))
-	log.Printf("syslog forwarding enabled: %s://%s (instance id %s)", proto, addr, instanceID)
+	return &syslogWriter{conn: conn}, fmt.Sprintf("syslog(%s://%s)", proto, addr)
 }
 
 type syslogWriter struct {
@@ -72,8 +93,13 @@ func (w *syslogWriter) Write(p []byte) (int, error) {
 	formatted := fmt.Sprintf("<%d>1 %s %s vulnapp-web %d - - %s\n",
 		pri, timestamp, instanceID, os.Getpid(), msg)
 
-	if _, err := w.conn.Write([]byte(formatted)); err != nil {
-		return 0, err
-	}
+	// Always report success to the caller regardless of whether the
+	// write actually reached the syslog server: this writer sits inside
+	// an io.MultiWriter alongside stderr and (optionally) the
+	// OneFirewall reporter in initLogging, and MultiWriter aborts every
+	// remaining writer the moment any one of them returns an error. A
+	// dead syslog connection should never silently take logging (or
+	// OneFirewall reporting) down with it.
+	w.conn.Write([]byte(formatted))
 	return len(p), nil
 }

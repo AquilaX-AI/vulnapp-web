@@ -68,6 +68,7 @@ HTTP_ADDR=:8080 HTTPS_ADDR=:8443 go run .
 | `TLS_KEY_FILE`   | *(none)* | Path to the matching private key                    |
 | `SYSLOG_ADDR`    | *(none)* | `host:port` of a real syslog/SIEM destination to forward every log line to (RFC 5424) |
 | `SYSLOG_PROTO`   | `udp`    | `udp` or `tcp`, for `SYSLOG_ADDR`                    |
+| `CTI_API_KEY`    | *(none)* | [OneFirewall](https://onefirewall.co.uk) threat-intel API key - if set, reports attacker IPs there (see below) |
 
 The HTTPS listener mints a fresh self-signed certificate on the fly for
 *whatever* hostname the client asks for via SNI (CN + `<host>` +
@@ -326,6 +327,50 @@ same anonymization principle as the `Host` header above, applied to the
 transport layer: an analyst can tell every line in a run came from "the
 same honeypot instance" without that identifier revealing which one, who
 runs it, or where.
+
+### Reporting attackers to OneFirewall
+
+Set `CTI_API_KEY` to a [OneFirewall](https://onefirewall.co.uk)
+threat-intel API key and this becomes a live sensor feeding it
+([`onefirewall.go`](onefirewall.go)): the same writer mechanism as the
+syslog forwarder above watches every log line for the `[T1234 Name |
+Category]` bracket, and for each one found, reports the attacker's IP to
+`POST https://app.onefirewall.com/api/v1/ips`:
+
+```json
+{
+  "ip": "203.0.113.7",
+  "confidence": 0.95,
+  "source": "velocitylabs",
+  "notes": "<the full log line - everything logdetail.go captured>",
+  "tags": ["T1190", "details#SQL Injection Attempt", "velocitylab", "honeynet"]
+}
+```
+
+- **`confidence`** is a per-MITRE-technique lookup table (`mitreConfidence`
+  in `onefirewall.go`): an actual exploit payload (SQLi, Log4Shell,
+  command injection, ...) scores 0.9-0.95; merely connecting to a fake
+  service with no further action (`T1133` alone) scores 0.5 - suspicious
+  on its own, but not proof of intent the way a live payload is.
+- **`tags`** always carries the MITRE code, a `details#`-prefixed plain-
+  English description (this part is public per OneFirewall's API), and
+  the two static tags `velocitylab`/`honeynet`.
+- Verified end-to-end against a local mock server (not the real API -
+  there's nothing to safely test against without a real key): confirmed
+  the exact JSON shape above, the raw (non-`Bearer`) `Authorization`
+  header, and that it fires from the same log line that drives the
+  syslog/MITRE-tagging output.
+- **Never reports private/loopback/link-local IPs** - confirmed by
+  testing that a real attack from `::1` produces zero outbound calls.
+  Without this, every bit of local testing of this very app would get
+  reported as a live attacker.
+- **Per-IP cooldown** of 5 minutes, so one scan burst (which can
+  generate hundreds of tagged lines in seconds) can't flood OneFirewall's
+  API or spin up hundreds of outbound goroutines.
+- Fire-and-forget: the actual HTTP call happens in a background
+  goroutine, so it can never add latency to the request/connection that
+  triggered it. Disabled by default - with no `CTI_API_KEY`, this is a
+  complete no-op, confirmed by testing with the variable unset.
 
 [`mitre.go`](mitre.go) holds the web-request classifier: it inspects the
 path, query string, form body (read and restored, so the real handler

@@ -33,7 +33,7 @@ import (
 var version = "dev"
 
 func main() {
-	initSyslog()
+	initLogging()
 
 	if err := initStore(); err != nil {
 		log.Fatalf("failed to initialize store: %v", err)
