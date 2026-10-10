@@ -519,18 +519,42 @@ Run it yourself: `gosec ./...`.
   bug (not a planted finding) that the race-condition features in
   [`pentest.go`](pentest.go) exposed during testing, since they were the
   first thing to actually hit the DB concurrently.
-- **Nothing here can meaningfully harm the host.** Command injection and
-  path traversal are faked (no real shell exec, no real filesystem
-  access); every feature that makes a real network call (SSRF via
-  `/fetch` and `/api/webhook-test`) is timeout- and size-bounded; every
-  panic (`/crash`, `/api/related`) is recovered; file uploads are held in
-  memory only and capped at 5MB; every fake service in
-  `fakeservices.go` only ever reads from or writes a fixed banner/
-  response to the socket - none of them parse, store, or act on what a
-  client sends. The ReDoS on `/api/validate-coupon` is real CPU cost, but
-  it's scoped to the one goroutine handling that request - confirmed the
-  rest of the app stays fully responsive while a 20+ second match runs -
-  and input is capped at 1000 characters.
+- **Nothing here can meaningfully harm the host - audited, not just
+  claimed.** A full pass confirmed: zero `os/exec` calls anywhere in the
+  codebase (command injection is entirely simulated via regex matching,
+  never a real shell); zero real file writes and zero `os.Open`/
+  `os.ReadFile` calls with a variable path anywhere (path traversal and
+  file upload are both in-memory only); every SSRF-capable feature
+  (`/fetch`, `/api/webhook-test`) is timeout- and size-bounded; every
+  HTTP panic is recovered by `recoverMiddleware`.
+  - **Every raw TCP/UDP fake-service handler is now wrapped in its own
+    panic recovery** (`runRecovered` in `fakeservices.go`), added after
+    this audit. Without it, a single malformed packet triggering a bug
+    in any one of the many hand-rolled binary parsers here (SNMP BER,
+    Modbus, MQTT, DICOM, JA3's TLS ClientHello parser, ...) would have
+    crashed the *entire process* - Go panics propagate up and kill the
+    whole program, not just the offending goroutine, unless recovered.
+    Proved this concretely: temporarily injected a real `panic()` into
+    the Modbus handler, confirmed the triggering connection died but the
+    main web app, FTP, and every other service kept running, then
+    reverted it.
+  - **The file-upload size cap was real only in the README, not in the
+    code**, until this audit caught it: `ParseMultipartForm`'s size
+    argument only bounds what's buffered in memory - it does **not**
+    reject a larger request body. A 50MB upload against the old code
+    succeeded with no error at all. Fixed with `http.MaxBytesReader`,
+    which actually enforces the limit; re-verified the same 50MB upload
+    now fails with `request body too large`. The upload map is also now
+    capped at 50 stored files (FIFO eviction), so repeated uploads under
+    the size cap can't still grow memory without bound over time.
+  - The ReDoS on `/api/validate-coupon` is real CPU cost, but it's scoped
+    to the one goroutine handling that request - confirmed the rest of
+    the app stays fully responsive while a 20+ second match runs - and
+    input is capped at 1000 characters.
+  - Every fake service that doesn't need to respond meaningfully
+    (NTP/memcached/SSDP/chargen) sends no reply at all, so none of them
+    can be used as a real-world amplification reflector against a third
+    party, regardless of what's in the request.
 - **TLS.** No cert/key files needed: the HTTPS listener mints a self-signed
   certificate in memory for whatever hostname a client asks for via SNI,
   caching it per hostname ([`tls.go`](tls.go)). Browsers and scanners will

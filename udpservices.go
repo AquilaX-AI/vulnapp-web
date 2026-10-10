@@ -39,8 +39,10 @@ func startUDPLogOnlyService(addr, label string) {
 			if err != nil {
 				return
 			}
-			log.Printf("%s sent %d bytes to %s (%s) [T1498.002 Network Denial of Service: Reflection Amplification | Amplification Vector Probe (no reply sent)]",
-				raddr, n, conn.LocalAddr(), label)
+			runRecovered(addr, func() {
+				log.Printf("%s sent %d bytes to %s (%s) [T1498.002 Network Denial of Service: Reflection Amplification | Amplification Vector Probe (no reply sent)]",
+					raddr, n, conn.LocalAddr(), label)
+			})
 		}
 	}()
 }
@@ -62,15 +64,17 @@ func startNTPService(addr string) {
 			if err != nil {
 				return
 			}
-			if n < 1 {
-				continue
-			}
-			mode := buf[0] & 0x07
-			if mode == 7 {
-				log.Printf("%s NTP mode-7 (private/monlist-class) request [T1498.002 Network Denial of Service: Reflection Amplification | NTP monlist (CVE-2013-5211) Amplification Probe (no reply sent)]", raddr)
-			} else {
-				log.Printf("%s NTP request, mode %d [T1595.002 Active Scanning: Vulnerability Scanning | NTP Service Probe (no reply sent)]", raddr, mode)
-			}
+			runRecovered(addr, func() {
+				if n < 1 {
+					return
+				}
+				mode := buf[0] & 0x07
+				if mode == 7 {
+					log.Printf("%s NTP mode-7 (private/monlist-class) request [T1498.002 Network Denial of Service: Reflection Amplification | NTP monlist (CVE-2013-5211) Amplification Probe (no reply sent)]", raddr)
+				} else {
+					log.Printf("%s NTP request, mode %d [T1595.002 Active Scanning: Vulnerability Scanning | NTP Service Probe (no reply sent)]", raddr, mode)
+				}
+			})
 		}
 	}()
 }
@@ -94,13 +98,15 @@ func startSNMPService(addr string) {
 			if err != nil {
 				return
 			}
-			community, requestID, ok := parseSNMPRequest(buf[:n])
-			if !ok {
-				continue
-			}
-			log.Printf("%s SNMP GetRequest community=%q [T1595.002 Active Scanning: Vulnerability Scanning | SNMP Default Community String Probe]", raddr, community)
-			resp := buildSNMPResponse(community, requestID)
-			conn.WriteTo(resp, raddr)
+			runRecovered(addr, func() {
+				community, requestID, ok := parseSNMPRequest(buf[:n])
+				if !ok {
+					return
+				}
+				log.Printf("%s SNMP GetRequest community=%q [T1595.002 Active Scanning: Vulnerability Scanning | SNMP Default Community String Probe]", raddr, community)
+				resp := buildSNMPResponse(community, requestID)
+				conn.WriteTo(resp, raddr)
+			})
 		}
 	}()
 }

@@ -167,6 +167,15 @@ func startSilentService(addr string) {
 	})
 }
 
+// acceptLoop is the single entry point every raw TCP fake service in
+// this repo (FTP, Telnet, MySQL, Redis/Memcached/ZooKeeper, VNC, SMTP/
+// IMAP/POP3, DNS AXFR, MQTT/Modbus/RTSP/DICOM, ...) goes through, which
+// makes it the one place that needs to guarantee a malformed/malicious
+// packet can only ever break *that one connection* - never the whole
+// process. Go panics propagate up and terminate the entire program
+// unless recovered; without this, a single bad packet to any one of
+// these hand-rolled parsers would take down every other fake service
+// and the main web app in the same process.
 func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 	for {
 		conn, err := ln.Accept()
@@ -174,8 +183,20 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 			return
 		}
 		log.Printf("%s connected to %s [T1133 External Remote Services | %s]", conn.RemoteAddr(), ln.Addr(), attackCategoryForAddr(ln.Addr().String()))
-		go handle(conn)
+		go runRecovered(ln.Addr().String(), func() { handle(conn) })
 	}
+}
+
+// runRecovered runs fn, logging and swallowing any panic instead of
+// letting it crash the process. Shared by acceptLoop and the UDP
+// service loops in udpservices.go.
+func runRecovered(context string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("recovered panic in fake service handler for %s: %v", context, rec)
+		}
+	}()
+	fn()
 }
 
 // portAttackCategory gives each fake service's port a plain-English

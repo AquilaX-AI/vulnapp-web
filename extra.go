@@ -141,7 +141,14 @@ func handleProfileUpdateMassAssignment(w http.ResponseWriter, r *http.Request) {
 var (
 	uploadsMu     sync.Mutex
 	uploadedFiles = map[string][]byte{}
+	uploadOrder   []string // insertion order, for FIFO eviction below
 )
+
+// maxStoredUploads bounds total memory used by uploads: each file is
+// already capped at 5MB (see handleUpload), so this caps the worst case
+// at roughly 50*5MB=250MB rather than growing without limit as an
+// attacker uploads more and more distinctly-named files over time.
+const maxStoredUploads = 50
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -157,6 +164,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ParseMultipartForm's size argument alone only bounds what's kept
+	// in memory - it does NOT reject a larger request body (the rest
+	// just spills to a temp file or gets read anyway). MaxBytesReader
+	// is what actually enforces a hard cap: reading past it fails the
+	// request outright. Verified empirically - without this, a 50MB
+	// upload against the old code succeeded with no error at all.
+	r.Body = http.MaxBytesReader(w, r.Body, 5<<20)
+
 	if err := r.ParseMultipartForm(5 << 20); err != nil {
 		fmt.Fprintf(w, "<p>Upload failed: %s</p>", err.Error())
 		fmt.Fprint(w, pageFooter)
@@ -171,7 +186,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	content, err := io.ReadAll(file)
+	content, err := io.ReadAll(io.LimitReader(file, 5<<20))
 	if err != nil {
 		fmt.Fprintf(w, "<p>Upload failed: %s</p>", err.Error())
 		fmt.Fprint(w, pageFooter)
@@ -179,7 +194,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uploadsMu.Lock()
+	if _, exists := uploadedFiles[header.Filename]; !exists {
+		uploadOrder = append(uploadOrder, header.Filename)
+	}
 	uploadedFiles[header.Filename] = content
+	for len(uploadOrder) > maxStoredUploads {
+		oldest := uploadOrder[0]
+		uploadOrder = uploadOrder[1:]
+		delete(uploadedFiles, oldest)
+	}
 	uploadsMu.Unlock()
 
 	fmt.Fprintf(w, `<h1>Uploaded</h1><p><a href="/uploads/user/%s">View your file</a></p>`, header.Filename)
