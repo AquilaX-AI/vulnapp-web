@@ -66,6 +66,9 @@ func main() {
 	// robots.txt that points a crawler straight at the "sensitive" areas -
 	// a very common real-world recon source.
 	mux.HandleFunc("/robots.txt", handleRobotsTxt)
+	mux.HandleFunc("/wp-login.php", handleWPLogin)
+	mux.HandleFunc("/xmlrpc.php", handleXMLRPC)
+	mux.HandleFunc("/wp-json/", handleWPJSON)
 	mux.HandleFunc("/__trap/", handleHoneytokenTrap)
 
 	// A fake OpenAPI spec is an even better recon source than robots.txt:
@@ -134,6 +137,7 @@ func main() {
 	startFakeServices()
 	startUDPServices()
 	startAIServices()
+	startIoTServices()
 	startRateDetectCleanup()
 
 	httpAddr := getenvDefault("HTTP_ADDR", ":80")

@@ -247,6 +247,18 @@ And edge devices - VPN/firewall/remote-access appliances - which GreyNoise's 202
 
 (Real deployments put edge-device portals on :443 of their own dedicated appliance IP; faked here on distinct ports purely to avoid colliding with this app's own HTTPS listener.)
 
+And the IoT/ICS/medical protocol families actually driving most internet-wide scanning traffic right now ([`iotservices.go`](iotservices.go)) - researched the same way as the AI-stack batch, not guessed at: JPCERT/CC's TSUBAME data names TCP/23 (Telnet) the single most-targeted port in 2026, largely Mirai; Modat's March 2026 scan found 973,819 active RTSP services with 8,074 giving up an unauthenticated frame; Shadowserver's daily Modbus scans find 6,300+ exposed instances (the protocol has no authentication mechanism at all); and TrendAI/Rapid7 research found 3,627 internet-reachable DICOM medical imaging servers, 99.56% accepting connections with no AE-Title validation. Three of these (MQTT, Modbus, DICOM) are **verified against real client libraries** completing genuine protocol handshakes, not just "looks right":
+
+| Port | Pretends to be | Fidelity |
+|---|---|---|
+| 1883 | MQTT broker | Real CONNACK/SUBACK - verified with `paho-mqtt` completing a full connect/subscribe/publish round trip |
+| 502 | Modbus TCP (ICS/SCADA) | Real register-read responses - verified with `pymodbus` successfully reading back fake register values |
+| 554 | RTSP (IP camera) | Real `OPTIONS`/`DESCRIBE` responses with a valid SDP body - no auth challenge at any step |
+| 104, 11112 | DICOM (medical imaging) | A real DICOM Upper Layer Protocol association handshake (PS3.8) - verified with `pynetdicom` reporting `is_established: True` and the correct accepted presentation context |
+| 23, 2323 | Telnet | Both ports Mirai's scanner specifically probes, per JPCERT/CC - same handler as the existing Telnet honeypot |
+
+`wp-login.php`, `xmlrpc.php`, and `wp-json/` are also faked directly on the main app's own ports ([`handlers.go`](handlers.go)) - not because this is a WordPress site, but because WordPress's market share means these paths get scanned on essentially every site regardless of what it actually runs. `xmlrpc.php`'s `system.listMethods` and `wp.getUsersBlogs`/`system.multicall` get distinct tags, since the latter is specifically the pingback-abuse/credential-brute-force vector XML-RPC is best known for.
+
 ## MITRE ATT&CK tagging in the logs
 
 Every contact with this app - a web request or a connection to any fake
@@ -411,7 +423,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **98 findings across 18 rule IDs**, including:
+reports **116 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|

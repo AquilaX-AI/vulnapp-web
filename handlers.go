@@ -820,6 +820,59 @@ func handleCrashStackTrace(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------
+// WordPress fingerprint bait. This isn't a WordPress site, but
+// wp-login.php/xmlrpc.php/wp-json get scanned on literally every site
+// regardless of what it actually runs, simply because WordPress's
+// market share makes "assume WordPress, check anyway" worth it for an
+// automated scanner. Fits the existing fake Apache/PHP banner too.
+// ---------------------------------------------------------------------
+
+func handleWPLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html><html><head>
+<title>Log In &lsaquo; Acme Supplies &#8212; WordPress</title>
+<meta name="generator" content="WordPress 5.8" />
+</head><body>
+<form name="loginform" method="post" action="/wp-login.php">
+  <input type="text" name="log" placeholder="Username or Email Address">
+  <input type="password" name="pwd" placeholder="Password">
+  <button type="submit">Log In</button>
+</form>
+</body></html>`)
+}
+
+func handleXMLRPC(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+
+	switch {
+	case strings.Contains(string(body), "system.listMethods"):
+		log.Printf("%s XML-RPC system.listMethods [T1595.002 Active Scanning: Vulnerability Scanning | WordPress XML-RPC Method Enumeration Attempt]", r.RemoteAddr)
+		fmt.Fprint(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data>
+<value><string>system.listMethods</string></value>
+<value><string>wp.getUsersBlogs</string></value>
+<value><string>pingback.ping</string></value>
+</data></array></value></param></params></methodResponse>`)
+	case strings.Contains(string(body), "wp.getUsersBlogs") || strings.Contains(string(body), "system.multicall"):
+		log.Printf("%s XML-RPC wp.getUsersBlogs/multicall [T1110 Brute Force | WordPress XML-RPC Brute-Force / Pingback Abuse Attempt]", r.RemoteAddr)
+		fmt.Fprint(w, `<?xml version="1.0"?><methodResponse><fault><value><struct>
+<member><name>faultCode</name><value><int>403</int></value></member>
+<member><name>faultString</name><value><string>Incorrect username or password.</string></value></member>
+</struct></value></fault></methodResponse>`)
+	default:
+		fmt.Fprint(w, `<?xml version="1.0"?><methodResponse><fault><value><struct>
+<member><name>faultCode</name><value><int>-32601</int></value></member>
+<member><name>faultString</name><value><string>server error. requested method not found</string></value></member>
+</struct></value></fault></methodResponse>`)
+	}
+}
+
+func handleWPJSON(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"name":"Acme Supplies","description":"Wholesale office & warehouse supplies","url":"http://acme-supplies.internal","namespaces":["wp/v2","oembed/1.0"]}`)
+}
+
+// ---------------------------------------------------------------------
 // robots.txt pointing straight at the "sensitive" areas - a classic
 // recon source that also helps a scanner's spider actually find them.
 // ---------------------------------------------------------------------
