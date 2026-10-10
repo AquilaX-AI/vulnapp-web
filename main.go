@@ -33,6 +33,8 @@ import (
 var version = "dev"
 
 func main() {
+	initSyslog()
+
 	if err := initStore(); err != nil {
 		log.Fatalf("failed to initialize store: %v", err)
 	}
@@ -211,10 +213,11 @@ func logMiddleware(next http.Handler) http.Handler {
 				tag = "T1595.002 Active Scanning: Vulnerability Scanning | High-Frequency Automated Scanning Detected"
 			}
 		}
+		details := attackDetails(r)
 		if tag != "" {
-			log.Printf("%s %s %s [%s]", r.RemoteAddr, r.Method, r.URL.String(), tag)
+			log.Printf("%s %s %s [%s] %s", r.RemoteAddr, r.Method, r.URL.String(), tag, details)
 		} else {
-			log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.String())
+			log.Printf("%s %s %s %s", r.RemoteAddr, r.Method, r.URL.String(), details)
 		}
 		// Verbose, deliberately outdated server banner disclosure: this is
 		// a Go binary, but it claims to be a long-EOL Apache/PHP stack so

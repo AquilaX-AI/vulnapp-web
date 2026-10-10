@@ -66,6 +66,8 @@ HTTP_ADDR=:8080 HTTPS_ADDR=:8443 go run .
 | `TLS_HOSTNAME`   | `velocity-labs.dev` | CN/SAN used when a client connects with no SNI hostname at all |
 | `TLS_CERT_FILE`  | *(none)* | Path to a real certificate (skips self-signed gen) |
 | `TLS_KEY_FILE`   | *(none)* | Path to the matching private key                    |
+| `SYSLOG_ADDR`    | *(none)* | `host:port` of a real syslog/SIEM destination to forward every log line to (RFC 5424) |
+| `SYSLOG_PROTO`   | `udp`    | `udp` or `tcp`, for `SYSLOG_ADDR`                    |
 
 The HTTPS listener mints a fresh self-signed certificate on the fly for
 *whatever* hostname the client asks for via SNI (CN + `<host>` +
@@ -268,9 +270,9 @@ attack-type/exploitability label, the same way a WAF/SIEM rule set tags
 traffic:
 
 ```
-2026/01/15 09:12:03 203.0.113.7 POST /login [T1190 Exploit Public-Facing Application | SQL Injection Attempt]
-2026/01/15 09:12:05 203.0.113.7 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files | Credential/Secrets Exposure Attempt]
-2026/01/15 09:12:08 203.0.113.7 connected to [::]:3306 [T1133 External Remote Services | Database Exploitation Attempt]
+2026/01/15 09:12:03 203.0.113.7:51234 POST /login [T1190 Exploit Public-Facing Application | SQL Injection Attempt] proto=http ua="sqlmap/1.7" referer="-" xff="-" content_length=33 body="username=admin%27+OR+%271%27%3D%271&password=x"
+2026/01/15 09:12:05 203.0.113.7:51235 GET /.env [T1552.001 Unsecured Credentials: Credentials In Files | Credential/Secrets Exposure Attempt] proto=http ua="curl/8.1.2" referer="-" xff="-" content_length=0 body="-"
+2026/01/15 09:12:08 203.0.113.7:51236 connected to [::]:3306 [T1133 External Remote Services | Database Exploitation Attempt]
 ```
 
 The MITRE technique name is intentionally abstract (the real ATT&CK
@@ -278,6 +280,41 @@ technique "Exploit Public-Facing Application" covers SQLi, SSTI, and a
 lot else) - the part after the `|` is this app's own label for what kind
 of attack that specific match actually represents, so the line is
 readable without a MITRE lookup.
+
+Every HTTP log line also carries protocol, `User-Agent`, `Referer`,
+`X-Forwarded-For`, content length, and a truncated body snippet
+([`logdetail.go`](logdetail.go)) - everything useful for actually
+analyzing what an attacker sent. The one thing deliberately **never**
+logged is the `Host` header: every other field here describes the
+attacker, but `Host` is the one piece of a request that identifies which
+hostname *this specific deployment* answers to - exactly what should
+stay anonymous if these logs get exported or shared with a threat-intel
+feed. (Sent a request with `Host: totally-real-internal-hostname.corp.
+acme.com` during testing - confirmed it never appears in the log line.)
+
+### Forwarding to real syslog
+
+Set `SYSLOG_ADDR` (and optionally `SYSLOG_PROTO`, default `udp`) and
+every log line - every one of the hundreds of `log.Printf` calls already
+in this codebase, no per-call-site changes - also gets forwarded as a
+real RFC 5424 syslog message ([`syslog.go`](syslog.go)):
+
+```sh
+SYSLOG_ADDR=siem.example.com:514 ./vulnapp-web
+```
+
+Verified against a real UDP listener:
+
+```
+<37>1 2026-01-15T09:12:03Z vulnapp-7d8e6b735808 vulnapp-web 40856 - - 2026/01/15 09:12:03 203.0.113.7:51234 GET /products?id=1 proto=http ...
+```
+
+The `HOSTNAME` field is never this process's real hostname - it's a
+random, stable-per-run `instanceID` generated at startup. That's the
+same anonymization principle as the `Host` header above, applied to the
+transport layer: an analyst can tell every line in a run came from "the
+same honeypot instance" without that identifier revealing which one, who
+runs it, or where.
 
 [`mitre.go`](mitre.go) holds the web-request classifier: it inspects the
 path, query string, form body (read and restored, so the real handler
@@ -423,7 +460,7 @@ combination explicitly, is the right tool to find it.
 ### SAST (gosec, Semgrep, CodeQL, ...)
 
 Running [gosec](https://github.com/securego/gosec) against this repo
-reports **116 findings across 18 rule IDs**, including:
+reports **119 findings across 18 rule IDs**, including:
 
 | Rule | What | Where |
 |---|---|---|
