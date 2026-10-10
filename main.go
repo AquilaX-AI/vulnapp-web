@@ -26,7 +26,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime/debug"
+	"syscall"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -187,7 +189,21 @@ func main() {
 		errCh <- srv.Serve(tlsLn)
 	}()
 
-	log.Fatal(<-errCh)
+	// Explicit signal handling rather than relying on Go's default
+	// unhandled-signal behavior, so shutdown is logged and deterministic -
+	// and so a Ctrl+C that still doesn't visibly stop the process points
+	// clearly at something outside this binary (a shell/sudo nesting
+	// issue) instead of leaving it ambiguous.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s, shutting down", sig)
+		os.Exit(0)
+	case err := <-errCh:
+		log.Fatal(err)
+	}
 }
 
 func getenvDefault(key, fallback string) string {
