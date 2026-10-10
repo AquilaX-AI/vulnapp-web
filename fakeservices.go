@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -182,9 +183,65 @@ func acceptLoop(ln net.Listener, handle func(net.Conn)) {
 		if err != nil {
 			return
 		}
-		log.Printf("%s connected to %s [T1133 External Remote Services | %s]", conn.RemoteAddr(), ln.Addr(), attackCategoryForAddr(ln.Addr().String()))
+		src, dest := conn.RemoteAddr().String(), ln.Addr().String()
+		rememberConnMeta(src, dest, "tcp", "")
+		log.Printf("%s connected to %s [T1133 External Remote Services | %s] dest=%s proto=tcp", src, dest, attackCategoryForAddr(dest), dest)
 		go runRecovered(ln.Addr().String(), func() { handle(conn) })
 	}
+}
+
+// connMeta caches the destination address, protocol, and (for HTTP fake
+// services) User-Agent of each active connection, keyed by the client's
+// source address - exactly the "ip:port" string every log.Printf call
+// site in this codebase already starts with. A connection's first log
+// line (the "connected to" line above, or the per-request line in
+// startFakeHTTPService) always carries this info directly; every later
+// line from the same connection - a login attempt, a command, a specific
+// protocol operation - usually doesn't, since the handler code logs just
+// the attack-relevant detail. The CSV attack log (csvlog.go) looks this
+// cache up by source address to fill in destination/protocol/user-agent
+// on those later lines without having to touch every individual handler.
+type connMeta struct {
+	dest, proto, ua string
+	seenAt          time.Time
+}
+
+var (
+	connMetaMu  sync.Mutex
+	connMetaMap = map[string]connMeta{}
+)
+
+func rememberConnMeta(src, dest, proto, ua string) {
+	connMetaMu.Lock()
+	connMetaMap[src] = connMeta{dest: dest, proto: proto, ua: ua, seenAt: time.Now()}
+	connMetaMu.Unlock()
+}
+
+func lookupConnMeta(src string) connMeta {
+	connMetaMu.Lock()
+	defer connMetaMu.Unlock()
+	return connMetaMap[src]
+}
+
+// init starts a cleanup sweep for connMetaMap so it can't grow without
+// bound across long uptimes - every entry is keyed by a distinct
+// "ip:port" source address that's only ever looked up while that
+// connection is still active (typically seconds).
+func init() {
+	go func() {
+		const ttl = 10 * time.Minute
+		for {
+			time.Sleep(ttl)
+			cutoff := time.Now().Add(-ttl)
+			connMetaMu.Lock()
+			for src, m := range connMetaMap {
+				if m.seenAt.Before(cutoff) {
+					delete(connMetaMap, src)
+				}
+			}
+			connMetaMu.Unlock()
+		}
+	}()
 }
 
 // runRecovered runs fn, logging and swallowing any panic instead of
@@ -586,8 +643,11 @@ func startFakeHTTPService(addr string, handler http.HandlerFunc) {
 		return
 	}
 	category := attackCategoryForAddr(addr)
+	dest := ln.Addr().String()
 	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s %s [T1133 External Remote Services | %s]", r.RemoteAddr, r.Method, r.URL.String(), category)
+		ua := r.Header.Get("User-Agent")
+		rememberConnMeta(r.RemoteAddr, dest, "http", ua)
+		log.Printf("%s %s %s [T1133 External Remote Services | %s] dest=%s proto=http ua=%q", r.RemoteAddr, r.Method, r.URL.String(), category, dest, ua)
 		handler(w, r)
 	})
 	srv := &http.Server{Handler: logged}

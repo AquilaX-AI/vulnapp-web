@@ -34,6 +34,12 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+// httpAddr/httpsAddr are set once in main() from HTTP_ADDR/HTTPS_ADDR (or
+// their defaults) and read from logMiddleware to record which listener an
+// attack-tagged request actually arrived on - ground truth, unlike the
+// client-supplied Host header.
+var httpAddr, httpsAddr string
+
 func main() {
 	initLogging()
 
@@ -146,8 +152,8 @@ func main() {
 	startIoTDeviceServices()
 	startRateDetectCleanup()
 
-	httpAddr := getenvDefault("HTTP_ADDR", ":80")
-	httpsAddr := getenvDefault("HTTPS_ADDR", ":443")
+	httpAddr = getenvDefault("HTTP_ADDR", ":80")
+	httpsAddr = getenvDefault("HTTPS_ADDR", ":443")
 
 	tlsConfig, err := certSource()
 	if err != nil {
@@ -233,7 +239,11 @@ func logMiddleware(next http.Handler) http.Handler {
 		}
 		details := attackDetails(r)
 		if tag != "" {
-			log.Printf("%s %s %s [%s] %s", r.RemoteAddr, r.Method, r.URL.String(), tag, details)
+			dest := httpAddr
+			if r.TLS != nil {
+				dest = httpsAddr
+			}
+			log.Printf("%s %s %s [%s] %s dest=%s", r.RemoteAddr, r.Method, r.URL.String(), tag, details, dest)
 		} else {
 			log.Printf("%s %s %s %s", r.RemoteAddr, r.Method, r.URL.String(), details)
 		}

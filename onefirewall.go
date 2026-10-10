@@ -32,7 +32,13 @@ func oneFirewallOutput() (io.Writer, string) {
 	return &oneFirewallWriter{}, "onefirewall-cti"
 }
 
-var mitreTagPattern = regexp.MustCompile(`\[(T\d+(?:\.\d+)?)\s+[^|]+\|\s*([^\]]+)\]`)
+// mitreTagPattern matches every "[T1234 Official Technique Name |
+// Plain-English Category]" bracket this codebase emits (mitre.go's
+// classifyRequest builds it as "%s %s | %s" from Code, Name, Category).
+// Group 1 is the code, group 2 the official name, group 3 the category -
+// shared by every log sink below that needs to parse it (OneFirewall
+// reporting, the CSV attack log).
+var mitreTagPattern = regexp.MustCompile(`\[(T\d+(?:\.\d+)?)\s+([^|]+)\|\s*([^\]]+)\]`)
 
 type oneFirewallWriter struct{}
 
@@ -45,7 +51,7 @@ func (w *oneFirewallWriter) Write(p []byte) (int, error) {
 	m := mitreTagPattern.FindStringSubmatch(line)
 	if m != nil {
 		code := strings.TrimSpace(m[1])
-		category := strings.TrimSpace(m[2])
+		category := strings.TrimSpace(m[3])
 		if ip := leadingIP(line); ip != "" {
 			reportToOneFirewall(ip, code, category, strings.TrimSpace(line))
 		}

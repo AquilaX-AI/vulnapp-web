@@ -27,16 +27,19 @@ func generateInstanceID() string {
 	return "vulnapp-" + hex.EncodeToString(b)
 }
 
-// initLogging composes every configured log sink - stderr always, plus
-// syslog and/or OneFirewall threat-intel reporting if their env vars are
-// set - into the one io.Writer Go's standard log package uses. Every
-// existing log.Printf call site in this codebase - no per-call-site
-// changes needed - reaches all of them. With nothing configured, logging
-// behaves exactly as before (stderr only).
+// initLogging composes every configured log sink - stderr and the local
+// CSV attack log always, plus syslog and/or OneFirewall threat-intel
+// reporting if their env vars are set - into the one io.Writer Go's
+// standard log package uses. Every existing log.Printf call site in this
+// codebase - no per-call-site changes needed - reaches all of them.
 func initLogging() {
 	writers := []io.Writer{os.Stderr}
 	var enabled []string
 
+	if w, desc := csvOutput(); w != nil {
+		writers = append(writers, w)
+		enabled = append(enabled, desc)
+	}
 	if w, desc := syslogOutput(); w != nil {
 		writers = append(writers, w)
 		enabled = append(enabled, desc)

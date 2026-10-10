@@ -40,8 +40,8 @@ func startUDPLogOnlyService(addr, label string) {
 				return
 			}
 			runRecovered(addr, func() {
-				log.Printf("%s sent %d bytes to %s (%s) [T1498.002 Network Denial of Service: Reflection Amplification | Amplification Vector Probe (no reply sent)]",
-					raddr, n, conn.LocalAddr(), label)
+				log.Printf("%s sent %d bytes to %s (%s) [T1498.002 Network Denial of Service: Reflection Amplification | Amplification Vector Probe (no reply sent)] dest=%s proto=udp",
+					raddr, n, conn.LocalAddr(), label, conn.LocalAddr())
 			})
 		}
 	}()
@@ -70,9 +70,9 @@ func startNTPService(addr string) {
 				}
 				mode := buf[0] & 0x07
 				if mode == 7 {
-					log.Printf("%s NTP mode-7 (private/monlist-class) request [T1498.002 Network Denial of Service: Reflection Amplification | NTP monlist (CVE-2013-5211) Amplification Probe (no reply sent)]", raddr)
+					log.Printf("%s NTP mode-7 (private/monlist-class) request [T1498.002 Network Denial of Service: Reflection Amplification | NTP monlist (CVE-2013-5211) Amplification Probe (no reply sent)] dest=%s proto=udp", raddr, conn.LocalAddr())
 				} else {
-					log.Printf("%s NTP request, mode %d [T1595.002 Active Scanning: Vulnerability Scanning | NTP Service Probe (no reply sent)]", raddr, mode)
+					log.Printf("%s NTP request, mode %d [T1595.002 Active Scanning: Vulnerability Scanning | NTP Service Probe (no reply sent)] dest=%s proto=udp", raddr, mode, conn.LocalAddr())
 				}
 			})
 		}
@@ -103,7 +103,7 @@ func startSNMPService(addr string) {
 				if !ok {
 					return
 				}
-				log.Printf("%s SNMP GetRequest community=%q [T1595.002 Active Scanning: Vulnerability Scanning | SNMP Default Community String Probe]", raddr, community)
+				log.Printf("%s SNMP GetRequest community=%q [T1595.002 Active Scanning: Vulnerability Scanning | SNMP Default Community String Probe] dest=%s proto=udp", raddr, community, conn.LocalAddr())
 				resp := buildSNMPResponse(community, requestID)
 				conn.WriteTo(resp, raddr)
 			})
