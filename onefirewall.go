@@ -164,7 +164,7 @@ func reportToOneFirewall(ip, code, category, notes string) {
 	body := map[string]any{
 		"ip":         ip,
 		"confidence": confidenceForCode(code),
-		"source":     "velocitylab",
+		"source":     "velocitylabs",
 		"notes":      notes,
 		"tags": []string{
 			code,
@@ -179,10 +179,27 @@ func reportToOneFirewall(ip, code, category, notes string) {
 		return
 	}
 
+	// Everything from here on MUST run inside the goroutine, never
+	// synchronously in this function: reportToOneFirewall is reached via
+	// oneFirewallWriter.Write(), which Go's standard log package invokes
+	// while holding its own internal mutex (it serializes all log
+	// output). Calling log.Printf synchronously from here - even just to
+	// log that a report is starting - re-enters that same non-reentrant
+	// mutex on the same goroutine and deadlocks permanently. That
+	// deadlock doesn't just break this one call either: every other
+	// goroutine's log.Printf (for any request, on any endpoint) then
+	// blocks forever on the same lock, freezing the entire process.
+	// Caught this exactly that way - one attack request froze the whole
+	// server, confirmed by a second curl to an unrelated endpoint also
+	// hanging - before moving this log line below, into the goroutine,
+	// which runs later, on a different goroutine, after the outer
+	// log.Printf call has already returned and released its lock.
 	go func() {
+		log.Printf("OneFirewall: reporting %s (%s, confidence %.2f)", ip, code, confidenceForCode(code))
 		client := &http.Client{Timeout: 5 * time.Second}
 		req, err := http.NewRequest(http.MethodPost, "https://app.onefirewall.com/api/v1/ips", bytes.NewReader(payload))
 		if err != nil {
+			log.Printf("OneFirewall report for %s: failed to build request: %v", ip, err)
 			return
 		}
 		req.Header.Set("Authorization", ctiAPIKey)
@@ -190,13 +207,15 @@ func reportToOneFirewall(ip, code, category, notes string) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("OneFirewall report for %s failed: %v", ip, err)
+			log.Printf("OneFirewall report for %s FAILED (network error): %v", ip, err)
 			return
 		}
 		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode >= 300 {
-			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			log.Printf("OneFirewall report for %s: unexpected status %s: %s", ip, resp.Status, respBody)
+			log.Printf("OneFirewall report for %s FAILED: HTTP %s: %s", ip, resp.Status, respBody)
+			return
 		}
+		log.Printf("OneFirewall report for %s accepted: HTTP %s", ip, resp.Status)
 	}()
 }
