@@ -24,7 +24,11 @@ func classifyRequest(r *http.Request) string {
 
 	for _, rule := range mitreRules {
 		if rule.Match(r, values) {
-			return fmt.Sprintf("%s %s | %s", rule.Code, rule.Name, rule.Category)
+			cat := rule.Category
+			if cat == "Web Vulnerability Probe" {
+				cat = webVuln2Category(r.URL.Path)
+			}
+			return fmt.Sprintf("%s %s | %s", rule.Code, rule.Name, cat)
 		}
 	}
 	return ""
@@ -115,6 +119,9 @@ var mitreRules = []mitreRule{
 	}},
 	{"T1005", "Data from Local System", "Path Traversal / Local File Disclosure Attempt", func(_ *http.Request, values []string) bool {
 		return anyMatch(values, traversalPattern)
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Web Vulnerability Probe", func(r *http.Request, _ []string) bool {
+		return webVuln2Category(r.URL.Path) != ""
 	}},
 	{"T1110", "Brute Force", "Credential Brute-Force Attempt", func(r *http.Request, _ []string) bool {
 		return r.Method == http.MethodPost && (r.URL.Path == "/login" || r.URL.Path == "/reset-password")

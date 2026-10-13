@@ -137,6 +137,9 @@ func main() {
 	mux.HandleFunc("/metadata/instance", handleAzureMetadata)
 	mux.HandleFunc("/api/webhook-test", handleWebhookTest)
 
+	// Second batch of web vulnerabilities - see webvulns2.go.
+	registerWebVulns2(mux)
+
 	handler := recoverMiddleware(logMiddleware(sessionFixationMiddleware(methodProbeMiddleware(mux))))
 
 	fmt.Printf("vulnapp-web %s\n", version)
@@ -150,6 +153,7 @@ func main() {
 	startIoTServices()
 	startICSServices()
 	startIoTDeviceServices()
+	startCVEHoneypots()
 	startRateDetectCleanup()
 
 	httpAddr = getenvDefault("HTTP_ADDR", ":80")

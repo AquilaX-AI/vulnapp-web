@@ -153,6 +153,33 @@ sudo ./vulnapp-web-vX.Y.Z-linux-amd64
 | Multi-cloud SSRF targets | `/computeMetadata/v1/...` (GCP), `/metadata/instance` (Azure) | Mirror the real header-based anti-SSRF checks those providers actually ship - reachable directly, but (correctly) *not* chainable through this app's own `/fetch`, which can't inject the required header |
 | Blind SSRF | `/api/webhook-test?url=` | Fetches server-side but never echoes the response - confirming it fired requires an out-of-band listener (Collaborator/webhook.site-style), unlike the "visible" SSRF on `/fetch` |
 
+Second batch ([`webvulns2.go`](webvulns2.go)) - all simulated in-process against fake in-memory data:
+
+| Area | Endpoint(s) | What's wrong |
+|---|---|---|
+| XXE | `POST /api/xml/import` | External entities resolved against the decoy file set (never the real filesystem); `http://` entities are logged as blind/OOB callbacks, never fetched |
+| Insecure deserialization | `/api/prefs/import?data=` | Base64 JSON honors a `"_type":"Command"` gadget; answers with canned shell output, never executes |
+| NoSQL injection | `POST /api/nosql/login` | `{"$ne":null}` operators in user/pass bypass authentication |
+| GraphQL abuse | `/graphql` | Introspection on, no depth limit, unauthenticated `user(id:)` IDOR, field-suggestion errors, alias-batched `login` with no lockout |
+| JWT `alg:none` | `/api/jwt/me` | Any-case `none` algorithm skips signature verification |
+| LDAP injection | `/directory?user=` | Input spliced into a simulated LDAP filter; `*)(uid=*` dumps all entries, unbalanced input leaks the filter in an error |
+| XPath injection | `POST /api/xpath-login` | `' or '1'='1` bypass; malformed input leaks the XPath expression |
+| Zip Slip | `POST /api/archive/extract` | Entry names joined onto the upload dir unsanitized (reports the path; writes nothing) |
+| Prototype pollution | `/api/settings/merge` -> `/api/settings/whoami` | Recursive merge honors `__proto__`, flipping `isAdmin` for later requests |
+| Log injection | `POST /feedback` | Unsanitized message written to the app log - CR/LF forges extra log lines |
+| 2FA bypass | `POST /api/2fa/verify` | OTP leaked in `X-Debug-Otp`, no attempt limit, empty/`null`/`[]` codes accepted |
+| BOLA | `/api/v2/orders/{id}` | Sequential IDs, no ownership check |
+| Excessive data exposure | `/api/v2/users` | Plaintext passwords, MD5 hashes, SSNs, API keys in a list endpoint |
+| 403 bypass | `/admin-panel` | Trusts `X-Original-URL` / `X-Rewrite-URL` for the access decision |
+| Predictable invite token | `/api/invite?email=` | Code is `md5(email)[:8]` and the issuing path leaks it as `debug_code` |
+| Format-string injection (CWE-134) | `/greet?fmt=` | User-controlled `fmt.Fprintf` format; `%+v` dumps a struct holding fake secrets |
+| Hidden debug parameter | `/api/status?debug=1` / `X-Debug` | Leaks fake env vars (DB URL, AWS secret, JWT secret) |
+| Web cache poisoning | `/landing` | Unkeyed `X-Forwarded-Host` reflected into a `public, max-age=600` page's script URL |
+| DOM XSS + postMessage | `/widget` | `location.hash` -> `innerHTML`; `message` handler with no origin check |
+| Blind stored XSS | `POST /support` -> `/support/agent` | Ticket rendered unescaped in a separate agent view the submitter never sees |
+| Password change w/o current password + CSRF | `/api/account/password` | No session, no current password, no CSRF token, any method |
+| Sensitive file/debug exposure | `/server-status`, `/server-info`, `/actuator`, `/actuator/env`, `/actuator/heapdump`, `/.htpasswd`, `/WEB-INF/web.xml`, `/.aws/credentials`, `/docker-compose.yml`, `/.DS_Store`, `/composer.json`, `/backup.zip` | Fake leftover/debug files with fake secrets |
+
 See [`handlers.go`](handlers.go) and [`pentest.go`](pentest.go) for the
 implementation of each, and [`decoy.go`](decoy.go) for the fake
 path-traversal fingerprints.
@@ -273,6 +300,198 @@ Two more industrial protocols ([`icsservices.go`](icsservices.go)) and the camer
 | 8090 | Dahua NetSurveillance WEB | Login page naming a firmware version |
 | 37777 | Dahua DHIP (proprietary) | Port accepts the connection and stays silent - undocumented binary protocol, no trusted client available to verify a fuller fake against |
 | 9100 | Raw/JetDirect network printing | Logs whatever's sent with no reply - that's the real protocol: a printer is a pure data sink, nothing to parse or respond to |
+
+## CVE honeypots (honeynet mode)
+
+On top of the generic exposed-service fakes above, the binary runs a
+**table-driven CVE honeynet**: 79 HTTP personas ([`cvehoneypots.go`](cvehoneypots.go)),
+38 TCP decoys and 18 UDP probes ([`cvetcp.go`](cvetcp.go)) - each one a real
+product pinned to a version with a real, mass-exploited CVE, on the port
+scanners actually probe for it. They exist to be *attacked*, so the log
+(and the CSV/syslog/OneFirewall sinks) captures exactly which CVE an
+attacker or botnet went after, with the full URI and the first bytes of
+the payload - second-stage downloader URLs included.
+
+**How they behave** (identical safety model to the rest of the app):
+
+- A believable landing page + `Server` banner for the product/version.
+- **Trap paths** copied from the public exploit's request shape (e.g. BIG-IP
+  `/mgmt/tm/util/bash`, WebLogic `/console/css/%252e%252e%252fconsole.portal`,
+  Apache 2.4.49 `.%2e/` traversal). Hitting one is logged as
+  `T1190 ... | <Product> Exploitation Attempt (<CVEs>)`; anything else is a
+  lower-severity `T1133` recon line.
+- **Bait**: if an exploit smuggles `id` / `whoami` / `uname`, the persona answers
+  with a canned root-looking reply so the attacker proceeds to the
+  interesting second stage. Path-traversal traps return decoy `/etc/passwd`
+  content. **Nothing is ever executed, parsed for real, fetched, or read from disk.**
+- UDP probes are log-only (no reply) for the same anti-reflection reason as
+  [`udpservices.go`](udpservices.go).
+- Every listener is best-effort: a port already taken by a real service on the
+  host is logged and skipped. HTTP personas are plain HTTP even for products
+  that are normally TLS-only, so any client can fingerprint them.
+
+**Where the list comes from.** Edge/VPN/firewall, managed-file-transfer, and
+enterprise-middleware personas follow CISA KEV additions and exploitation
+reporting through Oct 2026 (Citrix NetScaler, N-able N-central, Orkes
+Conductor, SharePoint "ToolShell", Ivanti EPMM, Cisco SD-WAN, Splunk,
+Langflow, ...) plus the "always scanned" classics (WebLogic, Struts, Solr,
+Shiro, Exchange ProxyLogon, ...). The 2026-numbered CVE IDs come from
+press/tracker summaries and have **not** been individually verified against NVD -
+treat them as labels for the bait, not as authoritative advisories. The
+version banners and trap paths, which are what scanners actually match
+on, follow the older, well-documented CVEs.
+
+### HTTP personas
+
+| Port | Pretends to be | CVE(s) |
+|---|---|---|
+| 4437 | Citrix NetScaler Gateway 14.1-47.40 | CVE-2023-4966,CVE-2019-19781,CVE-2026-88771 |
+| 4438 | Cisco ASA 9.14.1 | CVE-2020-3452,CVE-2024-20353 |
+| 4439 | Cisco IOS XE Web UI 17.3.1 | CVE-2023-20198,CVE-2023-20273 |
+| 4440 | Fortinet FortiWeb 7.4.0 | CVE-2025-64446 |
+| 4441 | Check Point Quantum Gateway R81.10 | CVE-2024-24919 |
+| 4442 | Ivanti Endpoint Manager Mobile (EPMM) 12.5.0.0 | CVE-2025-4427,CVE-2025-4428,CVE-2026-1281,CVE-2026-1340 |
+| 4443 | SonicWall SMA 100 10.2.1.1 | CVE-2021-20038,CVE-2021-20016 |
+| 4444 | Sophos Firewall SFOS 18.5.1 | CVE-2022-1040,CVE-2020-12271 |
+| 4445 | F5 BIG-IP 16.1.2 | CVE-2022-1388,CVE-2023-46747,CVE-2020-5902 |
+| 4446 | Juniper J-Web (Junos) 22.4R2 | CVE-2023-36844,CVE-2023-36845 |
+| 4447 | Zyxel USG FLEX 5.21 | CVE-2022-30525,CVE-2023-28771 |
+| 4448 | Palo Alto PAN-OS GlobalProtect 11.0.1 | CVE-2024-3400,CVE-2026-0310 |
+| 4449 | Cisco Catalyst SD-WAN Manager (vManage) 20.9.3 | CVE-2026-20127 |
+| 4451 | Progress MOVEit Transfer 2023.0.1 | CVE-2023-34362,CVE-2023-36934 |
+| 4452 | Progress WS_FTP Server 8.7.3 | CVE-2023-40044 |
+| 4453 | Fortra GoAnywhere MFT 7.4.1 | CVE-2024-0204,CVE-2025-10035 |
+| 4454 | Cleo Harmony / VLTrader 5.8.0.21 | CVE-2024-50623,CVE-2024-55956 |
+| 4455 | CrushFTP 10.8.3 | CVE-2025-31161,CVE-2025-54309,CVE-2024-4040 |
+| 5466 | Wing FTP Server 7.4.3 | CVE-2025-47812 |
+| 4456 | Microsoft SharePoint Server 16.0.10337 | CVE-2025-53770,CVE-2025-53771,CVE-2026-50522 |
+| 4457 | Microsoft Exchange Server 15.2.858.5 | CVE-2021-26855,CVE-2021-34473,CVE-2022-41082 |
+| 8530 | Microsoft WSUS 10.0.17763 | CVE-2025-59287 |
+| 8040 | ConnectWise ScreenConnect 23.9.7 | CVE-2024-1709,CVE-2024-1708 |
+| 4458 | SAP NetWeaver Visual Composer 7.50 | CVE-2025-31324 |
+| 4459 | Oracle E-Business Suite 12.2.14 | CVE-2025-61882,CVE-2025-61884 |
+| 4460 | Oracle Identity Manager 12.2.1.4 | CVE-2025-61757 |
+| 4461 | Adobe ColdFusion 2021 Update 5 | CVE-2023-26360,CVE-2023-29300,CVE-2024-20767 |
+| 4462 | N-able N-central 2025.3 | CVE-2026-86218,CVE-2026-86206,CVE-2026-86207 |
+| 4463 | Commvault Command Center 11.34 | CVE-2025-34028,CVE-2025-57788 |
+| 4464 | SimpleHelp Remote Support 5.5.7 | CVE-2024-57727,CVE-2024-57728 |
+| 9419 | Veeam Backup & Replication 12.1.0.2131 | CVE-2024-40711,CVE-2024-29849,CVE-2023-27532 |
+| 7001 | Oracle WebLogic Server 12.2.1.3.0 | CVE-2020-14882,CVE-2020-14883,CVE-2023-21839,CVE-2017-10271 |
+| 8983 | Apache Solr 8.11.0 | CVE-2019-17558,CVE-2021-44228,CVE-2019-0193 |
+| 4848 | Eclipse GlassFish 4.1 | CVE-2017-1000028,CVE-2011-0807 |
+| 8088 | Apache Hadoop YARN ResourceManager 2.7.3 | unauth-app-submit (no CVE; widespread cryptomining) |
+| 6066 | Apache Spark Standalone REST 2.3.0 | CVE-2018-11770 |
+| 8180 | Apache Tomcat 9.0.30 | CVE-2020-1938,CVE-2025-24813,CVE-2020-9484 |
+| 8085 | JBoss Application Server 6.1.0.Final | CVE-2017-12149,CVE-2015-7501,CVE-2017-7504 |
+| 8190 | Atlassian Confluence 8.5.3 | CVE-2023-22527,CVE-2023-22515,CVE-2022-26134 |
+| 8929 | GitLab CE 13.10.2 | CVE-2021-22205,CVE-2023-7028 |
+| 9443 | VMware vCenter Server 6.7.0 | CVE-2021-21972,CVE-2021-22005,CVE-2023-34048 |
+| 9251 | ManageEngine ADSelfService Plus 6113 | CVE-2021-40539,CVE-2022-28810 |
+| 8383 | ManageEngine Desktop Central 10.0.474 | CVE-2020-10189,CVE-2021-44515 |
+| 7071 | Zimbra Collaboration 8.8.15_GA_3869 | CVE-2022-27925,CVE-2022-37042,CVE-2022-41352 |
+| 2083 | cPanel 11.110.0.17 | CVE-2023-29489 |
+| 8111 | JetBrains TeamCity 2023.11.3 | CVE-2024-27198,CVE-2024-27199,CVE-2023-42793 |
+| 8082 | Spring Cloud Gateway 3.1.0 | CVE-2022-22947,CVE-2022-22963 |
+| 8084 | Apache Struts 2 Showcase 2.3.31 | CVE-2017-5638,CVE-2017-9805,CVE-2018-11776 |
+| 8087 | Apache Shiro app 1.2.4 | CVE-2016-4437,CVE-2020-1957,CVE-2020-11989 |
+| 8095 | phpMyAdmin 4.8.1 | CVE-2018-12613,CVE-2018-19968 |
+| 8096 | Laravel (debug mode) 8.4.2 / Ignition 2.5.1 | CVE-2021-3129 |
+| 8098 | Zabbix Server 7.0.0 | CVE-2024-42327,CVE-2022-23131 |
+| 8100 | Roundcube Webmail 1.6.9 | CVE-2025-49113,CVE-2023-43770 |
+| 8101 | Cacti 1.2.22 | CVE-2022-46169 |
+| 8102 | pfSense 2.5.2 | CVE-2022-31814,CVE-2023-42326 |
+| 5173 | Vite dev server 5.4.11 | CVE-2025-30208,CVE-2025-31125 |
+| 3002 | Grafana 8.3.0 | CVE-2021-43798,CVE-2021-41174 |
+| 3004 | Metabase 0.46.6 | CVE-2023-38646 |
+| 8089 | Splunk Enterprise management port 9.1.2 | CVE-2026-20253,CVE-2024-36985 |
+| 8107 | Apache Superset 2.0.1 | CVE-2023-27524 |
+| 8265 | Ray Dashboard 2.6.3 | CVE-2023-48022 (ShadowRay) |
+| 5001 | MLflow Tracking Server 2.1.1 | CVE-2023-1177,CVE-2023-6831 |
+| 8188 | ComfyUI 0.3.10 | unauth custom-node RCE (ComfyUI-Manager) |
+| 4466 | Langflow 1.2.0 | CVE-2025-3248,CVE-2026-33017 |
+| 4467 | n8n 1.65.0 | CVE-2025-68613,CVE-2026-21858 |
+| 4468 | Next.js app 14.2.24 | CVE-2025-29927,CVE-2025-55182 (React2Shell) |
+| 4472 | Orkes Conductor 3.21.0 | CVE-2026-58138 |
+| 8848 | Alibaba Nacos 2.0.3 | CVE-2021-29441,CVE-2023-45859 |
+| 9180 | Apache APISIX Admin API 2.12.1 | CVE-2022-24112,CVE-2021-45232 |
+| 4469 | Craft CMS 4.14.14 | CVE-2025-32432,CVE-2024-56145 |
+| 4470 | Adobe Commerce / Magento 2.4.6-p3 | CVE-2024-34102 (CosmicSting),CVE-2022-24086 |
+| 4471 | Apache OFBiz 18.12.9 | CVE-2023-51467,CVE-2024-38856 |
+| 8092 | Apache HTTP Server 2.4.49 | CVE-2021-41773,CVE-2021-42013 |
+| 8094 | Apache + PHP-CGI (Windows) 2.4.58 / PHP 8.1.26 | CVE-2024-4577 |
+| 3128 | Squid Proxy 3.5.20 | open-proxy / CVE-2019-18678 |
+| 7547 | TR-069 CWMP (home router) RomPager 4.07 | CVE-2014-9222 (Misfortune Cookie),CVE-2016-10372 |
+| 52869 | Realtek SDK miniigd UPnP 1.0 | CVE-2014-8361 |
+| 8083 | GPON home router H640 | CVE-2018-10561,CVE-2018-10562 |
+| 8844 | DrayTek Vigor 2960 1.5.1 | CVE-2020-8515,CVE-2024-12987 |
+
+### TCP decoys (banners, handshakes, silent ICS/legacy listeners)
+
+| Port | Pretends to be | CVE / issue |
+|---|---|---|
+| 2222 | Erlang/OTP SSH | CVE-2025-32433 |
+| 2223 | libssh | CVE-2018-10933 |
+| 2224 | OpenSSH 9.2p1 (regreSSHion) | CVE-2024-6387 |
+| 2226 | OpenSSH 7.2p2 | CVE-2016-6210,CVE-2018-15473 |
+| 2121 | ProFTPD 1.3.5 (mod_copy) | CVE-2015-3306 |
+| 2122 | vsFTPd 2.3.4 (backdoored) | CVE-2011-2523 |
+| 2525 | Exim 4.87 | CVE-2019-10149,CVE-2019-15846 |
+| 2526 | OpenSMTPD 6.6.1 | CVE-2020-7247 |
+| 873 | rsync 3.1.0 | unauthenticated module access |
+| 6667 | UnrealIRCd 3.2.8.1 (backdoored) | CVE-2010-2075 |
+| 5038 | Asterisk Call Manager | weak AMI credentials |
+| 3632 | distccd | CVE-2004-2687 |
+| 4786 | Cisco Smart Install | CVE-2018-0171 |
+| 541 | FortiManager FGFM | CVE-2024-47575 (FortiJump) |
+| 5555 | Android Debug Bridge | unauthenticated ADB (Mirai/crypto-miner droppers) |
+| 9300 | Elasticsearch transport | CVE-2015-1427,CVE-2014-3120 |
+| 111 | ONC RPC portmapper | rpcbind amplification / NFS enumeration |
+| 2049 | NFS | world-exportable shares |
+| 512 | rexec | legacy r-services trust abuse |
+| 513 | rlogin | legacy r-services trust abuse |
+| 514 | rsh | legacy r-services trust abuse |
+| 6000 | X11 | open X server |
+| 25565 | Minecraft Java server | CVE-2021-44228 (Log4Shell via chat) |
+| 2377 | Docker Swarm manager | exposed swarm control plane |
+| 4369 | Erlang EPMD | exposed Erlang distribution cookie |
+| 1099 | Java RMI Registry | CVE-2011-3556 (RMI deserialization) |
+| 5005 | Java Debug Wire Protocol (JDWP) | unauthenticated JDWP RCE |
+| 8009 | Apache JServ Protocol (AJP13) | CVE-2020-1938 (Ghostcat) |
+| 1080 | SOCKS5 open proxy | open proxy abuse |
+| 20000 | DNP3 | no authentication in base protocol |
+| 44818 | EtherNet/IP (CIP) | CVE-2022-1161,CVE-2021-22681 |
+| 1911 | Tridium Niagara Fox | CVE-2012-4027 |
+| 2404 | IEC 60870-5-104 | no authentication in base protocol |
+| 9600 | OMRON FINS | no authentication in base protocol |
+| 1962 | PCWorx | CVE-2019-9201 |
+| 789 | Red Lion Crimson | CVE-2018-14829 |
+| 18245 | GE SRTP | no authentication in base protocol |
+| 4000 | Emerson ROC | no authentication in base protocol |
+
+### UDP probes (log-only, never reply)
+
+| Port | Probe | CVE / issue |
+|---|---|---|
+| 623 (UDP) | IPMI / BMC | CVE-2013-4786 (RAKP hash disclosure) |
+| 69 (UDP) | TFTP | unauthenticated config download |
+| 5060 (UDP) | SIP | SIP scanning / toll fraud (SIPVicious) |
+| 1434 (UDP) | MSSQL Browser | SQL Slammer-class / amplification |
+| 389 (UDP) | CLDAP | CLDAP amplification |
+| 137 (UDP) | NetBIOS Name Service | name enumeration |
+| 111 (UDP) | RPC portmapper (UDP) | rpcbind amplification |
+| 5353 (UDP) | mDNS | mDNS amplification / information disclosure |
+| 3702 (UDP) | WS-Discovery | CVE-2019-17066 / amplification |
+| 427 (UDP) | SLP | CVE-2023-29552 amplification / CVE-2021-21974 (ESXi) |
+| 1194 (UDP) | OpenVPN | VPN fingerprinting |
+| 500 (UDP) | IKE | IKE aggressive-mode PSK capture |
+| 17185 (UDP) | VxWorks WDB debug agent | CVE-2010-2965 |
+| 47808 (UDP) | BACnet | building automation discovery |
+| 10001 (UDP) | Ubiquiti discovery | device fingerprinting |
+| 5683 (UDP) | CoAP | IoT amplification / discovery |
+| 177 (UDP) | XDMCP | open X display manager |
+| 1812 (UDP) | RADIUS | shared-secret brute force |
+
+Protocol-accurate handshakes (verified with `nc`): JDWP echo, Java RMI `ProtocolAck`, AJP13 CPing/CPong, SOCKS5 no-auth, rsync `#list`, ProFTPD `SITE CPFR/CPTO`.
 
 ## MITRE ATT&CK tagging in the logs
 
