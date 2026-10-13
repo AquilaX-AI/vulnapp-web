@@ -166,22 +166,25 @@ func smtpDecoyReply(l string) string {
 }
 
 func init() {
-	for _, d := range tcpDecoys {
+	for _, d := range allTCPDecoys() {
 		portAttackCategory[d.Port] = d.Category + " (" + d.CVEs + ")"
 		servicePortName[d.Port] = d.Product
 	}
 	// UDP and TCP share port numbers in the lookup map; only fill gaps,
 	// never overwrite a TCP entry. Done here (package init) because the
 	// map is read concurrently once listeners start.
-	for _, d := range udpDecoys {
+	for _, d := range allUDPDecoys() {
 		if _, ok := servicePortName[d.Port]; !ok {
 			servicePortName[d.Port] = d.Product
 		}
 	}
 }
 
+func allTCPDecoys() []tcpDecoy { return append(append([]tcpDecoy{}, tcpDecoys...), azureTCPDecoys...) }
+func allUDPDecoys() []udpDecoy { return append(append([]udpDecoy{}, udpDecoys...), azureUDPDecoys...) }
+
 func startCVETCPServices() {
-	for _, d := range tcpDecoys {
+	for _, d := range allTCPDecoys() {
 		d := d
 		ln, err := net.Listen("tcp", d.Port)
 		if err != nil {
@@ -282,7 +285,7 @@ func handleSOCKS5(conn net.Conn) {
 }
 
 func startCVEUDPServices() {
-	for _, d := range udpDecoys {
+	for _, d := range allUDPDecoys() {
 		d := d
 		conn, err := net.ListenPacket("udp", d.Port)
 		if err != nil {

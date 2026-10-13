@@ -49,8 +49,11 @@ func initLogging() {
 		enabled = append(enabled, desc)
 	}
 
+	// Always wrap, even with stderr alone: the refinement layer
+	// (mitrerefine.go) is what turns coarse technique tags into specific
+	// sub-techniques + tactic/class fields for every sink.
+	log.SetOutput(refiningWriter{io.MultiWriter(writers...)})
 	if len(writers) > 1 {
-		log.SetOutput(io.MultiWriter(writers...))
 		log.Printf("logging sinks enabled: %s (instance id %s)", strings.Join(enabled, ", "), instanceID)
 	}
 }

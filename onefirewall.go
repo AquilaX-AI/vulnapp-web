@@ -106,6 +106,67 @@ var mitreConfidence = map[string]float64{
 	"T1565.001": 0.6,  // unauthenticated printer access
 }
 
+var (
+	cveIDPattern     = regexp.MustCompile(`CVE-\d{4}-\d{4,7}`)
+	mitreBasePattern = regexp.MustCompile(`mitre_base=(T\d+(?:\.\d+)?)`)
+	tacticPattern    = regexp.MustCompile(`tactic="([^"]+)"`)
+	classPattern     = regexp.MustCompile(`attack_class="([^"]+)"`)
+	// exploitPayloadPattern spots content that is only ever sent by
+	// someone trying to execute something: downloaders, shells, and the
+	// classic "does it run" probes. Distinct from merely touching an
+	// exploit-shaped path.
+	exploitPayloadPattern = regexp.MustCompile("(?i)(wget\\s|curl\\s|/bin/(ba)?sh|bash\\s+-[ci]|nc\\s+-e|powershell|certutil|\\|\\s*sh\\b|(?:[;|&`$(>]|%3b|%7c)\\s*(id|whoami|uname)(?:\\s|$|[;|&)`\"']|%0a|%20|%26|%3b)|^AB;|SITE\\s+CPTO|JDWP-Handshake)")
+	webVuln2Set           = func() map[string]bool {
+		m := map[string]bool{}
+		for _, c := range webVuln2Categories {
+			m[c] = true
+		}
+		return m
+	}()
+)
+
+// confidenceForEvent scores one log line by how strongly it proves
+// hostile intent, rather than by MITRE technique alone - the same T1190
+// tag covers everything from "ran a SQLi payload" to "fetched a path an
+// exploit happens to use", and those are not equally damning:
+//
+//	0.98  a command/downloader payload was actually delivered
+//	0.95  exploit-shaped request to a CVE-specific trap (or a live
+//	      SQLi/XSS/Log4Shell/... payload, per mitreConfidence)
+//	0.85  data sent to a vulnerable-service decoy, or a trap for a
+//	      misconfiguration with no CVE
+//	0.80  hit a deliberately-vulnerable web endpoint (no payload seen)
+//	0.70  requested a commonly-scanned sensitive file / debug path
+//	0.60  scanning (UDP probes, scanner User-Agents, request bursts)
+//	0.50  merely connected / loaded a landing page
+func confidenceForEvent(code, category, line string) float64 {
+	// Scoring reasons about the evidence tier of the *original* coarse
+	// tag; refinement (mitrerefine.go) records it as mitre_base=.
+	if m := mitreBasePattern.FindStringSubmatch(line); m != nil {
+		code = m[1]
+	}
+	if strings.Contains(line, "rce_payload=true") || exploitPayloadPattern.MatchString(line) {
+		return 0.98
+	}
+	base := confidenceForCode(code)
+	switch {
+	case strings.Contains(line, " connected to "):
+		return 0.5
+	case webVuln2Set[category]:
+		if strings.HasPrefix(category, "Sensitive File") {
+			return 0.7
+		}
+		return 0.8
+	case code == "T1190" && strings.Contains(line, " sent ") && strings.Contains(line, "proto=tcp"):
+		return 0.85 // raw TCP decoy: bytes sent, no exploit-specific marker
+	case code == "T1190" && strings.Contains(category, "(CVE-"):
+		return 0.95
+	case code == "T1190" && strings.Contains(category, "Exploitation Attempt ("):
+		return 0.85 // trap for a CVE-less misconfiguration
+	}
+	return base
+}
+
 func confidenceForCode(code string) float64 {
 	if v, ok := mitreConfidence[code]; ok {
 		return v
@@ -122,6 +183,9 @@ const reportCooldown = 5 * time.Minute
 var (
 	reportedMu sync.Mutex
 	reportedAt = map[string]time.Time{}
+	// reportedConf is the highest confidence reported for an IP within its
+	// current cooldown window.
+	reportedConf = map[string]float64{}
 )
 
 func init() {
@@ -133,6 +197,7 @@ func init() {
 			for ip, t := range reportedAt {
 				if t.Before(cutoff) {
 					delete(reportedAt, ip)
+					delete(reportedConf, ip)
 				}
 			}
 			reportedMu.Unlock()
@@ -140,13 +205,22 @@ func init() {
 	}()
 }
 
-func shouldReport(ip string) bool {
+// shouldReport applies the per-IP cooldown, but lets a *stronger*
+// signal through: a scanner that first just connects (0.5) and then
+// delivers an exploit (0.95+) must not have the exploit swallowed by the
+// cooldown the connect started.
+func shouldReport(ip string, conf float64) bool {
 	reportedMu.Lock()
 	defer reportedMu.Unlock()
-	if last, ok := reportedAt[ip]; ok && time.Since(last) < reportCooldown {
+	last, seen := reportedAt[ip]
+	fresh := !seen || time.Since(last) >= reportCooldown
+	if !fresh && conf < reportedConf[ip]+0.1 {
 		return false
 	}
 	reportedAt[ip] = time.Now()
+	if fresh || conf > reportedConf[ip] {
+		reportedConf[ip] = conf
+	}
 	return true
 }
 
@@ -163,21 +237,22 @@ func reportToOneFirewall(ip, code, category, notes string) {
 	if parsed == nil || parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() || parsed.IsUnspecified() {
 		return
 	}
-	if !shouldReport(ip) {
+	conf := confidenceForEvent(code, category, notes)
+	if !shouldReport(ip, conf) {
 		return
 	}
 
 	body := map[string]any{
 		"ip":         ip,
-		"confidence": confidenceForCode(code),
+		"confidence": conf,
 		"source":     "velocitylabs",
 		"notes":      notes,
-		"tags": []string{
+		"tags": append([]string{
 			code,
 			"details#" + category,
 			"velocitylab",
 			"honeynet",
-		},
+		}, cveTags(notes)...),
 	}
 
 	payload, err := json.Marshal(body)
@@ -201,7 +276,7 @@ func reportToOneFirewall(ip, code, category, notes string) {
 	// which runs later, on a different goroutine, after the outer
 	// log.Printf call has already returned and released its lock.
 	go func() {
-		log.Printf("OneFirewall: reporting %s (%s, confidence %.2f)", ip, code, confidenceForCode(code))
+		log.Printf("OneFirewall: reporting %s (%s, confidence %.2f)", ip, code, conf)
 		client := &http.Client{Timeout: 5 * time.Second}
 		req, err := http.NewRequest(http.MethodPost, "https://app.onefirewall.com/api/v1/ips", bytes.NewReader(payload))
 		if err != nil {
@@ -224,4 +299,35 @@ func reportToOneFirewall(ip, code, category, notes string) {
 		}
 		log.Printf("OneFirewall report for %s accepted: HTTP %s", ip, resp.Status)
 	}()
+}
+
+// cveTags returns up to five "cve#CVE-YYYY-N" tags for the CVE IDs a log
+// line names, so the feed says exactly which vulnerability was targeted.
+func cveTags(line string) []string {
+	return append(cveIDTags(line), mitreContextTags(line)...)
+}
+
+// mitreContextTags carries the refined tactic and attack class (added by
+// mitrerefine.go) into the feed as tags.
+func mitreContextTags(line string) []string {
+	var out []string
+	if m := tacticPattern.FindStringSubmatch(line); m != nil {
+		out = append(out, "tactic#"+m[1])
+	}
+	if m := classPattern.FindStringSubmatch(line); m != nil {
+		out = append(out, "class#"+m[1])
+	}
+	return out
+}
+
+func cveIDTags(line string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range cveIDPattern.FindAllString(line, -1) {
+		if !seen[id] && len(out) < 5 {
+			seen[id] = true
+			out = append(out, "cve#"+id)
+		}
+	}
+	return out
 }

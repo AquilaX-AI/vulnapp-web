@@ -42,7 +42,12 @@ type cvePersona struct {
 	Server      string
 	Landing     string
 	TrapHeaders []string // request headers whose presence marks an exploit
-	Routes      []cveRoute
+	Headers     []string // "Name: value" headers added to every response
+	// RequireHeader, if set, must be present or the request gets the
+	// 400 a real instance metadata service returns (e.g. Azure IMDS
+	// demands "Metadata: true").
+	RequireHeader string
+	Routes        []cveRoute
 }
 
 func rt(path, body string) cveRoute   { return cveRoute{Path: path, Body: body} }
@@ -324,17 +329,21 @@ var cvePersonas = []cvePersona{
 // exploitCmdPattern spots a shell command smuggled into a request - the
 // first thing nearly every mass-exploitation script sends to check for
 // success (`id`, `whoami`, `uname`).
-var exploitCmdPattern = regexp.MustCompile("(?i)(?:[;|&`$(=+]|%3b|%7c|%26|%60|%24)\\s*(id|whoami|uname(?:\\s+-a)?)\\b")
+var exploitCmdPattern = regexp.MustCompile("(?i)(?:[;|&`$(=+>]|%3b|%7c|%26|%60|%24)\\s*(id|whoami|uname(?:\\s+-a)?)(?:\\s|$|[;|&)`\"'<]|%0a|%20|%26|%3b)")
 
 func init() {
-	for _, p := range cvePersonas {
+	for _, p := range allHTTPPersonas() {
 		portAttackCategory[p.Port] = p.Product + " Exploitation Attempt (" + p.CVEs + ")"
 		servicePortName[p.Port] = p.Product + " " + p.Version
 	}
 }
 
+func allHTTPPersonas() []cvePersona {
+	return append(append([]cvePersona{}, cvePersonas...), azurePersonas...)
+}
+
 func startCVEHoneypots() {
-	for _, p := range cvePersonas {
+	for _, p := range allHTTPPersonas() {
 		startCVEHTTPService(p)
 	}
 	startCVETCPServices()
@@ -364,8 +373,12 @@ func startCVEHTTPService(p cvePersona) {
 		}
 
 		if matched && route.Trap {
-			log.Printf("%s %s %s [T1190 Exploit Public-Facing Application | %s Exploitation Attempt (%s)] dest=%s proto=http ua=%q ct=%q body=%q",
-				r.RemoteAddr, r.Method, r.URL.RequestURI(), p.Product, p.CVEs, dest, ua, r.Header.Get("Content-Type"), truncate(string(body), 400))
+			payload := ""
+			if exploitCmdPattern.MatchString(r.URL.RequestURI()+" "+string(body)) || exploitPayloadPattern.MatchString(r.URL.RequestURI()+" "+string(body)) {
+				payload = " rce_payload=true"
+			}
+			log.Printf("%s %s %s [T1190 Exploit Public-Facing Application | %s Exploitation Attempt (%s)] dest=%s proto=http ua=%q ct=%q body=%q%s",
+				r.RemoteAddr, r.Method, r.URL.RequestURI(), p.Product, p.CVEs, dest, ua, r.Header.Get("Content-Type"), truncate(string(body), 400), payload)
 		} else {
 			log.Printf("%s %s %s [T1133 External Remote Services | %s] dest=%s proto=http ua=%q",
 				r.RemoteAddr, r.Method, r.URL.RequestURI(), category, dest, ua)
@@ -374,12 +387,23 @@ func startCVEHTTPService(p cvePersona) {
 		if p.Server != "" {
 			w.Header().Set("Server", p.Server)
 		}
+		for _, h := range p.Headers {
+			if name, val, ok := strings.Cut(h, ": "); ok {
+				w.Header().Set(name, val)
+			}
+		}
+		if p.RequireHeader != "" && r.Header.Get(p.RequireHeader) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":"Bad request. Required metadata header not specified"}`)
+			return
+		}
 		// Bait: a smuggled shell command gets a believable answer so the
 		// attacker moves on to the interesting second stage.
 		if matched && route.Trap {
 			if m := exploitCmdPattern.FindStringSubmatch(r.URL.RequestURI() + " " + string(body)); m != nil {
 				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				fmt.Fprint(w, strings.ReplaceAll(fakeShellOutput(m[1]), "www-data", "root"))
+				fmt.Fprint(w, rootShellOutput(m[1]))
 				return
 			}
 		}
@@ -429,4 +453,17 @@ func (p cvePersona) match(r *http.Request) (cveRoute, bool) {
 		}
 	}
 	return cveRoute{}, false
+}
+
+// rootShellOutput is fakeShellOutput's answer as a root-privileged
+// process - what a successful pre-auth RCE on most of these products
+// would look like.
+func rootShellOutput(cmd string) string {
+	switch first, _, _ := strings.Cut(strings.ToLower(cmd), " "); first {
+	case "id":
+		return "uid=0(root) gid=0(root) groups=0(root)\n"
+	case "whoami":
+		return "root\n"
+	}
+	return strings.ReplaceAll(fakeShellOutput(cmd), "www-data", "root")
 }

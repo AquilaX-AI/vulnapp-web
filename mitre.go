@@ -120,6 +120,22 @@ var mitreRules = []mitreRule{
 	{"T1005", "Data from Local System", "Path Traversal / Local File Disclosure Attempt", func(_ *http.Request, values []string) bool {
 		return anyMatch(values, traversalPattern)
 	}},
+	{"T1505.003", "Server Software Component: Web Shell", "Unrestricted File Upload Attempt", func(r *http.Request, _ []string) bool {
+		return r.URL.Path == "/upload" && r.Method == http.MethodPost
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Server-Side Request Forgery (SSRF) Attempt", func(r *http.Request, _ []string) bool {
+		return (r.URL.Path == "/fetch" || r.URL.Path == "/api/webhook-test") && r.URL.Query().Get("url") != ""
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Open Redirect Abuse Attempt", func(r *http.Request, _ []string) bool {
+		return r.URL.Path == "/redirect" && r.URL.Query().Get("url") != ""
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Financial Logic Abuse Attempt (CSRF / Race Condition)", func(r *http.Request, _ []string) bool {
+		return r.URL.Path == "/api/withdraw" || (r.URL.Path == "/transfer" && r.URL.Query().Get("to") != "")
+	}},
+	{"T1078", "Valid Accounts", "Broken Access Control (Forged Role Cookie) Attempt", func(r *http.Request, _ []string) bool {
+		c, err := r.Cookie("role")
+		return r.URL.Path == "/admin" && err == nil && c.Value != ""
+	}},
 	{"T1190", "Exploit Public-Facing Application", "Web Vulnerability Probe", func(r *http.Request, _ []string) bool {
 		return webVuln2Category(r.URL.Path) != ""
 	}},

@@ -493,6 +493,58 @@ on, follow the older, well-documented CVEs.
 
 Protocol-accurate handshakes (verified with `nc`): JDWP echo, Java RMI `ProtocolAck`, AJP13 CPing/CPong, SOCKS5 no-auth, rsync `#list`, ProFTPD `SITE CPFR/CPTO`.
 
+### Azure-style exposed services ([`azure.go`](azure.go))
+
+A second honeynet layer modeled on what internet scans of Azure address
+space actually turn up: storage with anonymous listing, Kudu/SCM, the
+managed-identity and instance-metadata endpoints that SSRF bugs target,
+Functions admin APIs, Key Vault / Container Registry with public access,
+**OMIGOD** (the OMI agent Azure silently installs on Linux VMs), Service
+Fabric, ADFS, RD Gateway, and the identity/data-plane ports (LDAPS,
+Kerberos, Cosmos DB, Event Hubs, SQL MI) that shouldn't face the
+internet. Same engine and safety model as above; the metadata endpoints
+mimic the real `Metadata: true` / `X-IDENTITY-HEADER` requirement (400
+without it). All tenant/subscription IDs, tokens and keys are fake.
+
+| Port | Pretends to be | Issue / CVE(s) |
+|---|---|---|
+| 10100 | Azure Blob Storage (public container) 2021-08-06 | anonymous container listing / leaked SAS token |
+| 10001 | Azure Queue Storage / Azurite 3.31.0 | storage emulator exposed with well-known dev key |
+| 10002 | Azure Table Storage / Azurite 3.31.0 | storage emulator exposed with well-known dev key |
+| 8900 | Azure Cosmos DB Emulator 2.14.x | emulator reachable with the documented public master key |
+| 8444 | Azure App Service Kudu (SCM) 1.0.0 | exposed Kudu: /api/settings, /api/command, /api/vfs |
+| 8445 | ASP.NET on Azure App Service (debug exposure) 4.8 | Easy Auth token leak, trace.axd/elmah.axd exposure |
+| 7073 | Azure Functions host 4.34.1 | exposed /admin APIs + leaked master/function keys |
+| 8310 | Azure App Service managed-identity endpoint (MSI) 2019-08-01 | SSRF -> managed identity token theft |
+| 8312 | Azure Instance Metadata Service (IMDS) 2023-07-01 | SSRF -> VM metadata & managed-identity token theft |
+| 32526 | Azure VM Guest Agent (WireServer / HostGAPlugin) 2015-04-05 | extension protectedSettings & goal-state disclosure |
+| 5986 | Microsoft OMI (OMIGOD) 1.6.8-1 | CVE-2021-38647,CVE-2021-38648,CVE-2021-38645,CVE-2021-38649 |
+| 1270 | Microsoft OMI (OMIGOD) - Azure Monitor/OMS agent 1.6.8-1 | CVE-2021-38647,CVE-2021-38648 |
+| 8202 | Azure Key Vault (public network access) 7.4 | vault reachable from the internet; weak/absent access policy |
+| 5002 | Azure Container Registry (anonymous pull) 2.0 | anonymous pull / admin user enabled |
+| 8093 | Azure DevOps Server (on-prem) 2020.1 | anonymous project access / leaked PATs in repos |
+| 19080 | Azure Service Fabric Explorer 9.1.1583.9590 | unauthenticated cluster management API |
+| 8442 | Azure HDInsight Ambari 2.7.5 | default admin/admin credentials |
+| 8998 | Apache Livy (HDInsight Spark) 0.7.0 | unauthenticated session creation -> RCE on the cluster |
+| 3500 | Dapr sidecar API (AKS / Container Apps) 1.13.2 | unauthenticated sidecar API (no app-api-token) |
+| 4481 | Active Directory Federation Services (ADFS) 10.0.17763 | metadata disclosure, user enumeration, password spray, Golden SAML |
+| 4482 | RD Web Access / RD Gateway 10.0.17763 | CVE-2020-0609,CVE-2020-0610,CVE-2019-0708 (adjacent RDP) |
+| 4483 | Azure Application Gateway (WAF detection mode) v2 | WAF in detection-only mode / backend origin bypass |
+| 4484 | Azure Front Door classic | origin exposed directly, bypassing Front Door WAF |
+| 636 | Entra Domain Services secure LDAP (LDAPS) | LDAPS exposed to the internet |
+| 389 | LDAP (Entra Domain Services / AD DS) | anonymous bind / enumeration |
+| 88 | Kerberos KDC | AS-REP roasting / Kerberoasting / user enumeration |
+| 3268 | AD Global Catalog | directory enumeration |
+| 135 | MS-RPC endpoint mapper | RPC enumeration (CVE-2003-0352 lineage) |
+| 3342 | Azure SQL Managed Instance public endpoint | public data endpoint exposed |
+| 6380 | Azure Cache for Redis (TLS) | public endpoint with leaked access key |
+| 5671 | Azure Service Bus / Event Hubs (AMQPS) | SAS key leaked in config |
+| 9093 | Azure Event Hubs Kafka endpoint | SAS key leaked in config |
+| 10255 | Azure Cosmos DB for MongoDB API | connection string leaked |
+| 19000 | Service Fabric client connection endpoint | unauthenticated cluster client port |
+| 4500 (UDP) | Azure VPN Gateway IPsec NAT-T | VPN fingerprinting / IKE probing |
+| 3391 (UDP) | RD Gateway UDP transport | CVE-2020-0609,CVE-2020-0610 |
+
 ## MITRE ATT&CK tagging in the logs
 
 Every contact with this app - a web request or a connection to any fake
@@ -523,6 +575,68 @@ hostname *this specific deployment* answers to - exactly what should
 stay anonymous if these logs get exported or shared with a threat-intel
 feed. (Sent a request with `Host: totally-real-internal-hostname.corp.
 acme.com` during testing - confirmed it never appears in the log line.)
+
+### Granular technique refinement
+
+Call sites tag events with a few coarse techniques (`T1190`, `T1133`,
+`T1595.002`, ...). [`mitrerefine.go`](mitrerefine.go) sits in front of
+**every** log sink (console, CSV, syslog, OneFirewall) and, per line:
+
+1. replaces the coarse technique with the most specific one that fits the
+   event's category (table below);
+2. appends `tactic="..."` (the ATT&CK tactic) and `attack_class="..."` (a
+   human-readable bucket such as *Cloud / Credential Theft* or *ICS/OT
+   Access*);
+3. appends `mitre_base=<coarse code>` whenever it changed the technique, so
+   confidence scoring still sees the original evidence tier.
+
+```
+... GET /metadata/identity/oauth2/token [T1528 Steal Application Access Token | Azure Instance Metadata Service (IMDS) Exploitation Attempt (...)] ... tactic="Credential Access" attack_class="Cloud / Credential Theft" mitre_base=T1190
+```
+
+Refinement reads only the **category string**, never request content, so a
+payload can't forge its own classification, and bare `connected to` lines
+keep `T1133` (connecting to an exposed remote service *is* External Remote
+Services). The main web app also gained rules for upload (`T1505.003`),
+SSRF, open redirect (`T1566.002`), financial-logic abuse (`T1657`) and
+forged-role-cookie access (`T1078`).
+
+| Category matches | Technique |
+|---|---|
+| `brute-?force` | T1110.001 Brute Force: Password Guessing |
+| `kerberos` | T1558 Steal or Forge Kerberos Tickets |
+| `managed-identity|\bIMDS\b|Instance Metadata|\(MSI\)` | T1528 Steal Application Access Token |
+| `Key Vault|Secrets Management` | T1555.006 Credentials from Password Stores: Cloud Secrets Management Stores |
+| `Azure (Blob|Queue|Table)|Cosmos DB` | T1530 Data from Cloud Storage |
+| `Cluster Secrets` | T1552.007 Unsecured Credentials: Container API |
+| `Docker Engine|Container Escape|Container Management|Deploy Container` | T1610 Deploy Container |
+| `Kubernetes|Kubelet|Container Orchestration|Swarm|Dapr` | T1609 Container Administration Command |
+| `Container Registry|Docker Registry|Container Image|Cluster Information` | T1613 Container and Resource Discovery |
+| `Remote Desktop` | T1021.001 Remote Services: Remote Desktop Protocol |
+| `File Share|\bSMB\b` | T1021.002 Remote Services: SMB/Windows Admin Shares |
+| `\bVNC\b` | T1021.005 Remote Services: VNC |
+| `Remote Management|\bWinRM\b` | T1021.006 Remote Services: Windows Remote Management |
+| `SSH|Java RMI|Remote Debugger|\bAJP\b|IRC Daemon|FTP Backdoor|FTP Arbitrary|Mail Server RCE|Distributed Compiler|Config Theft / RCE|Network Management Authentication Bypass|Erlang Node|Legacy Remote|Game Server` | T1210 Exploitation of Remote Services |
+| `RPC Service Enumeration` | T1046 Network Service Discovery |
+| `Zone Transfer` | T1590.002 Gather Victim Network Information: DNS |
+| `Source Disclosure|Artifact Repository` | T1213.003 Data from Information Repositories: Code Repositories |
+| `TFTP|Unauthenticated File Sync|Network File Share|Unauthorized File Access` | T1039 Data from Network Shared Drive |
+| `Open Proxy` | T1090 Proxy |
+| `Algorithm-None|JWT` | T1606 Forge Web Credentials |
+| `2FA Bypass` | T1111 Multi-Factor Authentication Interception |
+| `Unrestricted File Upload` | T1505.003 Server Software Component: Web Shell |
+| `Server-Side Request Forgery|SSRF Attempt` | T1190 Exploit Public-Facing Application |
+| `Open Redirect` | T1566.002 Phishing: Spearphishing Link |
+| `Financial|Race Condition` | T1657 Financial Theft |
+| `Denial of Service Attempt` | T1499.004 Endpoint Denial of Service: Application or System Exploitation |
+| `Command Injection|Shellshock|Gadget Command` | T1059.004 Command and Scripting Interpreter: Unix Shell |
+| `Sensitive File / Debug` | T1595.003 Active Scanning: Wordlist Scanning |
+| `Information Disclosure` | T1082 System Information Discovery |
+
+Tactics covered: Reconnaissance, Initial Access, Execution, Persistence,
+Credential Access, Discovery, Lateral Movement, Collection, Command and
+Control, Impact. OneFirewall reports carry `tactic#...` and `class#...`
+tags alongside the technique code.
 
 ### Attack log (CSV)
 
@@ -593,14 +707,22 @@ Category]` bracket, and for each one found, reports the attacker's IP to
 }
 ```
 
-- **`confidence`** is a per-MITRE-technique lookup table (`mitreConfidence`
-  in `onefirewall.go`): an actual exploit payload (SQLi, Log4Shell,
-  command injection, ...) scores 0.9-0.95; merely connecting to a fake
-  service with no further action (`T1133` alone) scores 0.5 - suspicious
-  on its own, but not proof of intent the way a live payload is.
+- **`confidence`** is scored **per event**, by how strongly that specific log line proves hostile intent (`confidenceForEvent` in `onefirewall.go`) - not just by MITRE technique, since the same `T1190` tag covers everything from a live payload to a request for a path an exploit happens to use:
+
+  | Confidence | Evidence |
+  |---|---|
+  | 0.98 | A command/downloader payload was actually delivered (`wget`/`curl`, `/bin/sh`, `;id`, `SITE CPTO`, ...) |
+  | 0.95 | Exploit-shaped request to a CVE-specific trap path, or a live SQLi/XSS/Log4Shell/... payload |
+  | 0.85 | Bytes sent to a raw-TCP vulnerable-service decoy, or a trap for a misconfiguration with no CVE |
+  | 0.80 | Hit a deliberately-vulnerable web endpoint, no payload seen |
+  | 0.70 | Requested a commonly-scanned sensitive file / debug path |
+  | 0.60 | Scanning: UDP probes, scanner User-Agents, request bursts |
+  | 0.50 | Merely connected, or loaded a fake service's landing page |
+
+  Other techniques (brute force, account discovery, ...) fall back to the per-technique table `mitreConfidence`.
 - **`tags`** always carries the MITRE code, a `details#`-prefixed plain-
   English description (this part is public per OneFirewall's API), and
-  the two static tags `velocitylab`/`honeynet`.
+  the two static tags `velocitylab`/`honeynet`, plus a `cve#CVE-YYYY-N` tag for each CVE the event names (up to five), so the feed says exactly which vulnerability was targeted.
 - Verified end-to-end against a local mock server (not the real API -
   there's nothing to safely test against without a real key): confirmed
   the exact JSON shape above, the raw (non-`Bearer`) `Authorization`
@@ -610,7 +732,7 @@ Category]` bracket, and for each one found, reports the attacker's IP to
   testing that a real attack from `::1` produces zero outbound calls.
   Without this, every bit of local testing of this very app would get
   reported as a live attacker.
-- **Per-IP cooldown** of 5 minutes, so one scan burst (which can
+- **Per-IP cooldown** of 5 minutes - with escalation: a *stronger* signal (>= +0.1 confidence) still goes through, so a scanner that connects (0.5) and then fires an exploit (0.95+) isn't hidden by the cooldown the connect started. One scan burst (which can
   generate hundreds of tagged lines in seconds) can't flood OneFirewall's
   API or spin up hundreds of outbound goroutines.
 - Fire-and-forget: the actual HTTP call happens in a background
