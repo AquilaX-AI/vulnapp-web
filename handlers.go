@@ -248,7 +248,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 		username, password,
 	)
 
-	rows, err := db.Query(query)
+	rows, err := guardedQuery(query)
 	if err != nil {
 		// Error-based SQLi: the raw database error is reflected back.
 		fmt.Fprint(w, pageHeader("Sign in"))
@@ -308,7 +308,7 @@ func handleLoginSQLi(w http.ResponseWriter, r *http.Request) {
 	// Username enumeration: a second, equally vulnerable query decides
 	// which error message to show.
 	existsQuery := fmt.Sprintf("SELECT 1 FROM users WHERE username='%s'", username)
-	existsRows, err := db.Query(existsQuery)
+	existsRows, err := guardedQuery(existsQuery)
 	if err != nil {
 		fmt.Fprint(w, pageHeader("Sign in"))
 		fmt.Fprint(w, sqlErrorBanner("/var/www/html/login.php", err))
@@ -350,7 +350,7 @@ func handleProductsSQLi(w http.ResponseWriter, r *http.Request) {
 	// /products?id=0 UNION SELECT username, password, 0 FROM users
 	query := fmt.Sprintf("SELECT id, name, price FROM products WHERE id = %s", id)
 
-	rows, err := db.Query(query)
+	rows, err := guardedQuery(query)
 	if err != nil {
 		fmt.Fprint(w, sqlErrorBanner("/var/www/html/products.php", err))
 		fmt.Fprint(w, pageFooter)

@@ -111,6 +111,9 @@ var mitreRules = []mitreRule{
 	{"T1059", "Command and Scripting Interpreter", "Command Injection Attempt", func(_ *http.Request, values []string) bool {
 		return anyMatch(values, cmdInjectPattern)
 	}},
+	{"T1190", "Exploit Public-Facing Application", "SQL Injection - Stacked Query / Filesystem Escape Attempt (Blocked)", func(_ *http.Request, values []string) bool {
+		return anyMatch(values, dangerousSQLPattern) || anyMatchFunc(values, hasStackedStatement)
+	}},
 	{"T1190", "Exploit Public-Facing Application", "SQL Injection Attempt", func(_ *http.Request, values []string) bool {
 		return anyMatch(values, sqliPattern)
 	}},
@@ -163,6 +166,15 @@ var mitreRules = []mitreRule{
 func anyMatch(values []string, re *regexp.Regexp) bool {
 	for _, v := range values {
 		if re.MatchString(v) {
+			return true
+		}
+	}
+	return false
+}
+
+func anyMatchFunc(values []string, pred func(string) bool) bool {
+	for _, v := range values {
+		if pred(v) {
 			return true
 		}
 	}
