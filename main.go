@@ -97,6 +97,12 @@ func main() {
 	mux.HandleFunc("/config.php.bak", handleConfigPhpBak)
 	mux.HandleFunc("/phpinfo.php", handlePhpInfo)
 
+	// A full spread of fake .php pages (catalog, login, admin, LFI/RFI
+	// sinks, dropped-webshell filenames) so the PHP/Apache banner the
+	// server advertises is backed by a believable PHP site - see
+	// phppages.go.
+	registerPHPPages(mux)
+
 	// Exposed pprof - the classic real-world Go misconfiguration.
 	registerPprof(mux)
 

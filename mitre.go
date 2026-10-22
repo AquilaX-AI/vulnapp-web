@@ -126,6 +126,23 @@ var mitreRules = []mitreRule{
 	{"T1505.003", "Server Software Component: Web Shell", "Unrestricted File Upload Attempt", func(r *http.Request, _ []string) bool {
 		return r.URL.Path == "/upload" && r.Method == http.MethodPost
 	}},
+	{"T1505.003", "Server Software Component: Web Shell", "Web Shell Access Attempt", func(r *http.Request, _ []string) bool {
+		return isPHPBackdoorPath(r.URL.Path)
+	}},
+	{"T1190", "Exploit Public-Facing Application", "Remote File Inclusion Attempt", func(r *http.Request, _ []string) bool {
+		switch r.URL.Path {
+		case "/view.php", "/page.php", "/download.php":
+		default:
+			return false
+		}
+		for _, k := range []string{"page", "inc", "file"} {
+			v := strings.ToLower(r.URL.Query().Get(k))
+			if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") || strings.HasPrefix(v, "//") {
+				return true
+			}
+		}
+		return false
+	}},
 	{"T1190", "Exploit Public-Facing Application", "Server-Side Request Forgery (SSRF) Attempt", func(r *http.Request, _ []string) bool {
 		return (r.URL.Path == "/fetch" || r.URL.Path == "/api/webhook-test") && r.URL.Query().Get("url") != ""
 	}},
